@@ -52,7 +52,7 @@ def configurar_pagina() -> None:
 
 
 def _entrenar_motor_base(
-    half_life: float, n_sims: int, db_path: Optional[str] = None
+    half_life: float, db_path: Optional[str] = None
 ) -> tuple[NBAEnsembleEngine, pd.DataFrame, pd.DataFrame]:
     """
     Inicializa SQLite, verifica que haya historial cargado (si está vacío, inicializa un
@@ -66,7 +66,7 @@ def _entrenar_motor_base(
         df = cargar_partidos_df(db_path=db_path)
 
     df_feat, tracker, elo_sys = construir_dataset_cronologico(df)
-    engine = NBAEnsembleEngine(half_life=half_life, n_sims=n_sims)
+    engine = NBAEnsembleEngine(half_life=half_life, n_sims=DEFAULT_MC_SIMS)
     engine.tracker = tracker
     engine.elo_sys = elo_sys
     engine.fit(df, df_features_precomputed=df_feat)
@@ -75,17 +75,37 @@ def _entrenar_motor_base(
 
 @st.cache_resource(show_spinner=False)
 def _cargar_motor_cached(
-    half_life: float, n_sims: int, db_path: Optional[str] = None
+    half_life: float, db_path: Optional[str] = None
 ) -> tuple[NBAEnsembleEngine, pd.DataFrame, pd.DataFrame]:
-    return _entrenar_motor_base(half_life=half_life, n_sims=n_sims, db_path=db_path)
+    return _entrenar_motor_base(half_life=half_life, db_path=db_path)
 
 
 def cargar_motor_entrenado(
     half_life: float, n_sims: int, db_path: Optional[str] = None
 ) -> tuple[NBAEnsembleEngine, pd.DataFrame, pd.DataFrame]:
     if hasattr(st, "cache_resource") and db_path is None:
-        return _cargar_motor_cached(half_life=half_life, n_sims=n_sims, db_path=db_path)
-    return _entrenar_motor_base(half_life=half_life, n_sims=n_sims, db_path=db_path)
+        engine, df, df_feat = _cargar_motor_cached(half_life=half_life, db_path=db_path)
+    else:
+        engine, df, df_feat = _entrenar_motor_base(half_life=half_life, db_path=db_path)
+    engine.n_sims = int(n_sims)
+    return engine, df, df_feat
+
+
+@st.cache_data(show_spinner=False)
+def _ejecutar_backtest_cached(
+    n_rows: int,
+    max_fecha: str,
+    warmup_games: int,
+    half_life: float,
+    umbral_ev_pct: float,
+    _df_partidos: pd.DataFrame,
+) -> Dict[str, Any]:
+    return ejecutar_backtest_walk_forward(
+        df_partidos=_df_partidos,
+        warmup_games=warmup_games,
+        half_life=half_life,
+        umbral_ev_pct=umbral_ev_pct,
+    )
 
 
 def render_sidebar() -> Dict[str, Any]:
@@ -168,14 +188,17 @@ def render_tab_prediccion(
         st.warning("Selecciona dos franquicias NBA distintas para ejecutar la simulación.")
         return
 
-    pred = engine.predecir_partido_completo(
-        local=local,
-        visita=visita,
-        fecha=fecha_sel,
-        casa_apuestas=params["casa_apuestas"],
-        n_sims=params["n_sims"],
-    )
-    st.session_state["ultima_prediccion"] = pred
+    pred_key = f"{local}_{visita}_{fecha_sel}_{params['casa_apuestas']}_{params['half_life']}_{params['n_sims']}"
+    if st.session_state.get("ultima_pred_key") != pred_key or "ultima_prediccion" not in st.session_state:
+        st.session_state["ultima_prediccion"] = engine.predecir_partido_completo(
+            local=local,
+            visita=visita,
+            fecha=fecha_sel,
+            casa_apuestas=params["casa_apuestas"],
+            n_sims=params["n_sims"],
+        )
+        st.session_state["ultima_pred_key"] = pred_key
+    pred = st.session_state["ultima_prediccion"]
 
     # 1. Tarjeta obligatoria con el diagnóstico físico (Fatiga B2B, 3-in-4, Rest Advantage y Altitud)
     fatiga = pred["fatiga"]
@@ -666,26 +689,34 @@ def render_tab_combinadas(
         st.info("Agrega al menos 2 partidos a la cartelera o pulsa 'Buscar Partidos en ESPN NBA'.")
         return
 
-    # Analizar todos los partidos de la noche
-    predicciones_noche: List[Dict[str, Any]] = []
-    for idx_g, g in enumerate(cartelera):
-        loc_g = normalizar_equipo(g.get("local"))
-        vis_g = normalizar_equipo(g.get("visita"))
-        if not loc_g or not vis_g or loc_g == vis_g:
-            continue
-        p_g = engine.predecir_partido_completo(
-            local=loc_g,
-            visita=vis_g,
-            fecha=g.get("fecha", str(fecha_busqueda)),
-            casa_apuestas=params["casa_apuestas"],
-            n_sims=params["n_sims"],
-            seed=42 + idx_g,
-        )
-        predicciones_noche.append(p_g)
-
-    res_combos = armar_combinadas_y_zona_picante(
-        predicciones_noche, casa_apuestas=params["casa_apuestas"]
+    # Analizar todos los partidos de la noche (con caché en session_state para navegación instantánea)
+    combo_cache_key = (
+        str([(g.get("local"), g.get("visita"), g.get("fecha")) for g in cartelera])
+        + f"_{params['casa_apuestas']}_{params['half_life']}_{params['n_sims']}"
     )
+    if st.session_state.get("combo_cache_key") != combo_cache_key or "ultimo_res_combos" not in st.session_state:
+        predicciones_noche: List[Dict[str, Any]] = []
+        for idx_g, g in enumerate(cartelera):
+            loc_g = normalizar_equipo(g.get("local"))
+            vis_g = normalizar_equipo(g.get("visita"))
+            if not loc_g or not vis_g or loc_g == vis_g:
+                continue
+            p_g = engine.predecir_partido_completo(
+                local=loc_g,
+                visita=vis_g,
+                fecha=g.get("fecha", str(fecha_busqueda)),
+                casa_apuestas=params["casa_apuestas"],
+                n_sims=params["n_sims"],
+                seed=42 + idx_g,
+            )
+            predicciones_noche.append(p_g)
+
+        st.session_state["ultimo_res_combos"] = armar_combinadas_y_zona_picante(
+            predicciones_noche, casa_apuestas=params["casa_apuestas"]
+        )
+        st.session_state["combo_cache_key"] = combo_cache_key
+
+    res_combos = st.session_state["ultimo_res_combos"]
 
     # 2. Ranking de Seguridad de la Noche
     st.markdown("#### 🛡️ 2. Ranking de Seguridad de la Noche (Con Detector de Fatiga B2B y Consenso)")
@@ -819,12 +850,23 @@ def render_tab_backtest(df_partidos: pd.DataFrame, params: Dict[str, Any]) -> No
         ejecutar_btn = st.button("🚀 Ejecutar Backtest Walk-Forward", use_container_width=True)
 
     if ejecutar_btn or "ultimo_backtest" not in st.session_state:
-        st.session_state["ultimo_backtest"] = ejecutar_backtest_walk_forward(
-            df_partidos=df_partidos,
-            warmup_games=warmup,
-            half_life=params["half_life"],
-            umbral_ev_pct=umbral_ev,
-        )
+        max_f = str(df_partidos["fecha"].max()) if not df_partidos.empty else ""
+        if hasattr(st, "cache_data"):
+            st.session_state["ultimo_backtest"] = _ejecutar_backtest_cached(
+                n_rows=len(df_partidos),
+                max_fecha=max_f,
+                warmup_games=warmup,
+                half_life=params["half_life"],
+                umbral_ev_pct=umbral_ev,
+                _df_partidos=df_partidos,
+            )
+        else:
+            st.session_state["ultimo_backtest"] = ejecutar_backtest_walk_forward(
+                df_partidos=df_partidos,
+                warmup_games=warmup,
+                half_life=params["half_life"],
+                umbral_ev_pct=umbral_ev,
+            )
 
     bt = st.session_state["ultimo_backtest"]
     if bt.get("status") != "ok":
@@ -884,6 +926,8 @@ def render_tab_datos(df_partidos: pd.DataFrame) -> None:
             )
             if hasattr(st, "cache_resource"):
                 st.cache_resource.clear()
+            if hasattr(st, "cache_data"):
+                st.cache_data.clear()
             st.success(f"¡Descarga completada! Se procesaron y almacenaron {n_guardados} partidos en SQLite.")
             st.rerun()
 
@@ -891,6 +935,8 @@ def render_tab_datos(df_partidos: pd.DataFrame) -> None:
             n_rec = actualizar_partidos_recientes(dias_atras=7)
             if hasattr(st, "cache_resource"):
                 st.cache_resource.clear()
+            if hasattr(st, "cache_data"):
+                st.cache_data.clear()
             st.success(f"Se actualizaron {n_rec} partidos recientes con detalle de cuartos y boxscore.")
             st.rerun()
 
@@ -906,6 +952,8 @@ def render_tab_datos(df_partidos: pd.DataFrame) -> None:
                     res_imp = importar_archivo_usuario(archivo_subido, nombre_archivo=archivo_subido.name)
                     if hasattr(st, "cache_resource"):
                         st.cache_resource.clear()
+                    if hasattr(st, "cache_data"):
+                        st.cache_data.clear()
                     st.success(res_imp["mensaje"])
                     st.rerun()
                 except Exception as exc:
