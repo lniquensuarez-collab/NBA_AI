@@ -51,7 +51,7 @@ def configurar_pagina() -> None:
     )
 
 
-def cargar_motor_entrenado(
+def _entrenar_motor_base(
     half_life: float, n_sims: int, db_path: Optional[str] = None
 ) -> tuple[NBAEnsembleEngine, pd.DataFrame, pd.DataFrame]:
     """
@@ -71,6 +71,21 @@ def cargar_motor_entrenado(
     engine.elo_sys = elo_sys
     engine.fit(df, df_features_precomputed=df_feat)
     return engine, df, df_feat
+
+
+@st.cache_resource(show_spinner=False)
+def _cargar_motor_cached(
+    half_life: float, n_sims: int, db_path: Optional[str] = None
+) -> tuple[NBAEnsembleEngine, pd.DataFrame, pd.DataFrame]:
+    return _entrenar_motor_base(half_life=half_life, n_sims=n_sims, db_path=db_path)
+
+
+def cargar_motor_entrenado(
+    half_life: float, n_sims: int, db_path: Optional[str] = None
+) -> tuple[NBAEnsembleEngine, pd.DataFrame, pd.DataFrame]:
+    if hasattr(st, "cache_resource") and db_path is None:
+        return _cargar_motor_cached(half_life=half_life, n_sims=n_sims, db_path=db_path)
+    return _entrenar_motor_base(half_life=half_life, n_sims=n_sims, db_path=db_path)
 
 
 def render_sidebar() -> Dict[str, Any]:
@@ -609,12 +624,23 @@ def render_tab_combinadas(
         st.write("")
         st.write("")
         if st.button("🔎 Buscar Partidos en ESPN NBA", use_container_width=True):
-            encontrados = buscar_cartelera_nba(fecha_inicio=fecha_busqueda, dias_adelante=dias_adelante)
+            encontrados = buscar_cartelera_nba(
+                fecha_inicio=fecha_busqueda,
+                dias_adelante=dias_adelante,
+                buscar_proxima_disponible=True,
+            )
             if encontrados:
                 st.session_state["cartelera_activa"] = encontrados
-                st.success(f"Se cargaron {len(encontrados)} partidos oficiales desde ESPN NBA.")
+                fechas_enc = sorted({str(x.get("fecha", "")) for x in encontrados})
+                if str(fecha_busqueda) in fechas_enc:
+                    st.success(f"Se cargaron {len(encontrados)} partidos oficiales desde ESPN NBA ({', '.join(fechas_enc)}).")
+                else:
+                    st.info(
+                        f"En la fecha seleccionada ({fecha_busqueda}) no hubo jornada NBA; "
+                        f"se cargaron automáticamente {len(encontrados)} partidos oficiales de la jornada más cercana en ESPN ({', '.join(fechas_enc)})."
+                    )
             else:
-                st.warning("No se encontraron partidos en vivo en ESPN para esa fecha o sin conexión; puedes gestionar cruces manualmente abajo.")
+                st.warning("No se encontraron partidos en vivo en ESPN (temporada en pausa o sin conexión); puedes usar la cartelera cargada o añadir cruces manualmente abajo.")
 
     # Gestión manual de cruces (añadir o limpiar)
     with st.expander("➕ Añadir o Quitar Partidos Manualmente a la Jornada", expanded=False):
@@ -856,11 +882,15 @@ def render_tab_datos(df_partidos: pd.DataFrame) -> None:
                 max_workers=10,
                 progress_callback=lambda p, txt: barra.progress(min(1.0, float(p)), text=txt),
             )
+            if hasattr(st, "cache_resource"):
+                st.cache_resource.clear()
             st.success(f"¡Descarga completada! Se procesaron y almacenaron {n_guardados} partidos en SQLite.")
             st.rerun()
 
         if st.button("🔄 Actualizar Últimos 7 Días (Scoreboard & Cuartos Q1/1H)", use_container_width=True):
             n_rec = actualizar_partidos_recientes(dias_atras=7)
+            if hasattr(st, "cache_resource"):
+                st.cache_resource.clear()
             st.success(f"Se actualizaron {n_rec} partidos recientes con detalle de cuartos y boxscore.")
             st.rerun()
 
@@ -874,6 +904,8 @@ def render_tab_datos(df_partidos: pd.DataFrame) -> None:
             if st.button("📥 Importar Archivo a SQLite", use_container_width=True):
                 try:
                     res_imp = importar_archivo_usuario(archivo_subido, nombre_archivo=archivo_subido.name)
+                    if hasattr(st, "cache_resource"):
+                        st.cache_resource.clear()
                     st.success(res_imp["mensaje"])
                     st.rerun()
                 except Exception as exc:

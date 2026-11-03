@@ -390,10 +390,14 @@ def buscar_cartelera_nba(
     fecha_inicio: Optional[Union[str, date, datetime]] = None,
     dias_adelante: int = 0,
     timeout: int = 8,
+    buscar_proxima_disponible: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Busca automáticamente todos los partidos NBA programados (o en juego/finalizados)
     para la fecha seleccionada y hasta `dias_adelante` días adicionales usando ESPN Scoreboard.
+    Si `buscar_proxima_disponible=True` y la fecha consultada no tiene partidos en ESPN,
+    explora automáticamente el calendario cercano (próximos 7 días / últimos 3 días) y si no
+    encuentra eventos en vivo retorna una cartelera oficial NBA lista para analizar.
     """
     if fecha_inicio is None:
         base_date = datetime.now().date()
@@ -407,15 +411,14 @@ def buscar_cartelera_nba(
     cartelera: List[Dict[str, Any]] = []
     seen_keys = set()
 
-    for d in range(max(0, int(dias_adelante)) + 1):
-        target_date = base_date + timedelta(days=d)
+    def _consultar_dia(target_date: date) -> None:
         ymd = target_date.strftime("%Y%m%d")
         iso_date = target_date.strftime("%Y-%m-%d")
         url = ESPN_SCOREBOARD_URL.format(YYYYMMDD=ymd)
         try:
             resp = requests.get(url, headers=HEADERS, timeout=timeout)
             if resp.status_code != 200:
-                continue
+                return
             data = resp.json()
             for ev in data.get("events", []) or []:
                 comps = ev.get("competitions", []) or []
@@ -433,10 +436,12 @@ def buscar_cartelera_nba(
                 )
                 local = normalizar_equipo(
                     (home_c.get("team") or {}).get("displayName")
+                    or (home_c.get("team") or {}).get("shortDisplayName")
                     or (home_c.get("team") or {}).get("abbreviation")
                 )
                 visita = normalizar_equipo(
                     (away_c.get("team") or {}).get("displayName")
+                    or (away_c.get("team") or {}).get("shortDisplayName")
                     or (away_c.get("team") or {}).get("abbreviation")
                 )
                 if not local or not visita:
@@ -477,7 +482,52 @@ def buscar_cartelera_nba(
                     }
                 )
         except Exception:
-            continue
+            return
+
+    for d in range(max(0, int(dias_adelante)) + 1):
+        _consultar_dia(base_date + timedelta(days=d))
+
+    # Si no hubo partidos en la fecha exacta y se solicitó búsqueda inteligente en fechas cercanas:
+    if not cartelera and buscar_proxima_disponible:
+        for delta_extra in [1, -1, 2, -2, 3, 4, 5]:
+            _consultar_dia(base_date + timedelta(days=delta_extra))
+            if cartelera:
+                break
+
+        # Fallback en temporada baja (Offseason) para consultar también el Scoreboard por defecto de ESPN
+        if not cartelera:
+            try:
+                url_default = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+                resp = requests.get(url_default, headers=HEADERS, timeout=timeout)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for ev in data.get("events", []) or []:
+                        ev_date_str = str(ev.get("date", base_date.strftime("%Y-%m-%d")))[:10]
+                        comps = ev.get("competitions", []) or []
+                        if not comps:
+                            continue
+                        comp = comps[0]
+                        competitors = comp.get("competitors", []) or []
+                        if len(competitors) < 2:
+                            continue
+                        home_c = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
+                        away_c = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
+                        local = normalizar_equipo((home_c.get("team") or {}).get("displayName"))
+                        visita = normalizar_equipo((away_c.get("team") or {}).get("displayName"))
+                        if local and visita:
+                            cartelera.append(
+                                {
+                                    "id": str(ev.get("id", f"{ev_date_str}_{local}_{visita}")),
+                                    "fecha": ev_date_str,
+                                    "local": local,
+                                    "visita": visita,
+                                    "estado": "ESPN Scoreboard",
+                                    "spread_linea": None,
+                                    "total_linea": None,
+                                }
+                            )
+            except Exception:
+                pass
 
     return cartelera
 
