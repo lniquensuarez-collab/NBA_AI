@@ -63,6 +63,13 @@ from engine.models import (
     armar_combinadas_y_zona_picante,
 )
 from engine.backtest import ejecutar_backtest_walk_forward
+from engine.players import (
+    obtener_jugadores_equipo,
+    obtener_catalogo_completo_jugadores,
+    calcular_impacto_bajas,
+    proyectar_y_simular_jugador,
+    proyectar_plantilla_partido,
+)
 
 
 class TestNBAUltimateEngine(unittest.TestCase):
@@ -247,7 +254,34 @@ class TestNBAUltimateEngine(unittest.TestCase):
         self.assertIn("log_loss", bt["metricas_ensemble"])
         self.assertIn("mae_spread_pts", bt["metricas_ensemble"])
         self.assertIn("roi_yield_pct", bt["simulacion_financiera"])
-        print("✅ [7/7] Backtest Walk-Forward cronológico y Simulación Financiera verificados.")
+        print("✅ [7/8] Backtest Walk-Forward cronológico y Simulación Financiera verificados.")
+
+    def test_08_estadisticas_jugadores_props_y_bajas(self) -> None:
+        df_cat = obtener_catalogo_completo_jugadores()
+        self.assertGreaterEqual(len(df_cat), 90)
+        self.assertIn("PRA (PTS+REB+AST)", df_cat.columns)
+
+        bos_players = obtener_jugadores_equipo("Boston Celtics")
+        self.assertGreaterEqual(len(bos_players), 4)
+        tatum = bos_players[0]
+        sim_tatum = proyectar_y_simular_jugador(tatum, es_local=True, pace_esperado=100.5, drtg_rival=115.2, n_sims=3000)
+        for m_code in ["PTS", "REB", "AST", "3PM", "PRA"]:
+            self.assertIn(m_code, sim_tatum["mercados"])
+            self.assertAlmostEqual(
+                sim_tatum["mercados"][m_code]["prob_over"] + sim_tatum["mercados"][m_code]["prob_under"],
+                1.0,
+                places=3,
+            )
+
+        bajas_info = calcular_impacto_bajas(
+            "Boston Celtics", "Los Angeles Lakers", bajas_local=["Jayson Tatum"], bajas_visita=[]
+        )
+        self.assertLess(bajas_info["ajuste_spread_local_pts"], 0.0)
+        self.assertLess(bajas_info["ajuste_total_pts"], 0.0)
+
+        plantilla = proyectar_plantilla_partido("Boston Celtics", "Los Angeles Lakers", n_sims=2000)
+        self.assertGreaterEqual(len(plantilla["top_props"]), 5)
+        print("✅ [8/8] Estadísticas de Jugadores, Player Props (PTS, REB, AST, 3PM, PRA) y Simulador de Bajas verificados.")
 
 
 if __name__ == "__main__":

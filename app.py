@@ -40,6 +40,13 @@ from engine.models import (
     armar_combinadas_y_zona_picante,
 )
 from engine.backtest import ejecutar_backtest_walk_forward
+from engine.players import (
+    obtener_jugadores_equipo,
+    obtener_catalogo_completo_jugadores,
+    calcular_impacto_bajas,
+    proyectar_y_simular_jugador,
+    proyectar_plantilla_partido,
+)
 
 
 def configurar_pagina() -> None:
@@ -199,7 +206,44 @@ def render_tab_prediccion(
         st.warning("Selecciona dos franquicias NBA distintas para ejecutar la simulación.")
         return
 
-    pred_key = f"{local}_{visita}_{fecha_sel}_{params['casa_apuestas']}_{params['half_life']}_{params['n_sims']}"
+    # Selector de Bajas / Ausencias de Estrellas para ajustar el Spread y Total del partido en vivo
+    roster_l = obtener_jugadores_equipo(local)
+    roster_v = obtener_jugadores_equipo(visita)
+    nombres_l = [p["jugador"] for p in roster_l]
+    nombres_v = [p["jugador"] for p in roster_v]
+
+    with st.expander("🏥 Simulador de Bajas / Ausencias de Estrellas y Resumen del Quinteto", expanded=False):
+        cb1, cb2 = st.columns(2)
+        with cb1:
+            bajas_l = st.multiselect(
+                f"Bajas / Ausentes en {local}",
+                options=nombres_l,
+                default=[],
+                key="bajas_local_pred",
+            )
+        with cb2:
+            bajas_v = st.multiselect(
+                f"Bajas / Ausentes en {visita}",
+                options=nombres_v,
+                default=[],
+                key="bajas_visita_pred",
+            )
+
+        info_bajas = calcular_impacto_bajas(local, visita, bajas_local=bajas_l, bajas_visita=bajas_v)
+        if bajas_l or bajas_v:
+            st.warning(
+                f"⚠️ **Ajuste por Bajas Aplicado:** Impacto en Spread Local: `{info_bajas['ajuste_spread_local_pts']:+.2f} pts` "
+                f"| Impacto en Total del Partido: `{info_bajas['ajuste_total_pts']:+.2f} pts` "
+                f"(Penalización {local}: `{info_bajas['penalizacion_local_pts']:.1f} pts`, "
+                f"Penalización {visita}: `{info_bajas['penalizacion_visita_pts']:.1f} pts`)."
+            )
+        else:
+            st.caption("Ambos equipos con quintetos estelares completos (0.00 pts de ajuste por bajas).")
+
+    pred_key = (
+        f"{local}_{visita}_{fecha_sel}_{params['casa_apuestas']}_"
+        f"{params['half_life']}_{params['n_sims']}_{tuple(bajas_l)}_{tuple(bajas_v)}"
+    )
     if st.session_state.get("ultima_pred_key") != pred_key or "ultima_prediccion" not in st.session_state:
         st.session_state["ultima_prediccion"] = engine.predecir_partido_completo(
             local=local,
@@ -207,8 +251,12 @@ def render_tab_prediccion(
             fecha=fecha_sel,
             casa_apuestas=params["casa_apuestas"],
             n_sims=params["n_sims"],
+            ajuste_bajas_spread_local=info_bajas["ajuste_spread_local_pts"],
+            ajuste_bajas_total=info_bajas["ajuste_total_pts"],
         )
         st.session_state["ultima_pred_key"] = pred_key
+        st.session_state["ultimas_bajas_l"] = bajas_l
+        st.session_state["ultimas_bajas_v"] = bajas_v
     pred = st.session_state["ultima_prediccion"]
 
     # 1. Tarjeta obligatoria con el diagnóstico físico (Fatiga B2B, 3-in-4, Rest Advantage y Altitud)
@@ -346,7 +394,25 @@ def render_tab_prediccion(
         )
         st.dataframe(df_ff, use_container_width=True, hide_index=True)
 
-    # 7. Tablas de Mercados: Spread / Hándicap, Totales Over/Under, Team Totals y Q1 / 1H
+    # 7. Resumen de Estrellas y Top Player Props del Partido Actual (PTS, REB, AST, 3PM, PRA)
+    with st.expander("⛹️‍♂️ Resumen de Estrellas del Partido & Top Player Props (PTS, REB, AST, 3PM, PRA)", expanded=False):
+        ft_now = pred["features"]
+        plantilla_proj = proyectar_plantilla_partido(
+            equipo_local=local,
+            equipo_visita=visita,
+            pace_esperado=pilares["pace_esperado"],
+            drtg_local=ft_now["drtg_l"],
+            drtg_visita=ft_now["drtg_v"],
+            b2b_local=bool(ft_now["b2b_l"]),
+            b2b_visita=bool(ft_now["b2b_v"]),
+            bajas_local=st.session_state.get("ultimas_bajas_l", []),
+            bajas_visita=st.session_state.get("ultimas_bajas_v", []),
+            n_sims=3000,
+        )
+        st.markdown("**🔥 Top 8 Player Props Más Seguros del Partido (Monte Carlo):**")
+        st.dataframe(pd.DataFrame(plantilla_proj["top_props"]), use_container_width=True, hide_index=True)
+
+    # 8. Tablas de Mercados: Spread / Hándicap, Totales Over/Under, Team Totals y Q1 / 1H
     sub1, sub2, sub3, sub4 = st.tabs(
         [
             "📏 Hándicap / Spread (-12.5 a +12.5)",
@@ -913,6 +979,180 @@ def render_tab_backtest(df_partidos: pd.DataFrame, params: Dict[str, Any]) -> No
             st.info("Ningún partido superó el umbral de EV% seleccionado.")
 
 
+def render_tab_jugadores(
+    engine: NBAEnsembleEngine, params: Dict[str, Any]
+) -> None:
+    """
+    Pestaña dedicada: ⛹️‍♂️ Jugadores & Props
+    - Proyecciones y Simulación de Monte Carlo para Puntos (PTS), Rebotes (REB),
+      Asistencias (AST), Triples (3PM) y Combos PRA (PTS+REB+AST).
+    - Calculadora individual de líneas y cuotas (Over/Under + EV% + 1/4 Kelly) ideal para
+      Betano y Betsafe Bet Builder.
+    - Tabla de líderes y catálogo de estrellas NBA.
+    """
+    st.subheader("⛹️‍♂️ Estadísticas de Jugadores & Laboratorio de Player Props (PTS, REB, AST, 3PM, PRA)")
+
+    pred = st.session_state.get("ultima_prediccion")
+    if not pred:
+        pred = engine.predecir_partido_completo(
+            local="Boston Celtics",
+            visita="Los Angeles Lakers",
+            casa_apuestas=params["casa_apuestas"],
+            n_sims=params["n_sims"],
+        )
+
+    local = pred["local"]
+    visita = pred["visita"]
+    pilares = pred["pilares"]
+    ft = pred["features"]
+    bajas_l = st.session_state.get("ultimas_bajas_l", [])
+    bajas_v = st.session_state.get("ultimas_bajas_v", [])
+
+    st.caption(
+        f"Contexto activo del partido: **{visita} @ {local}** | "
+        f"Ritmo Esperado (Pace): **{pilares['pace_esperado']:.1f} poss** | "
+        f"DRtg {local}: **{ft['drtg_l']:.1f}** · DRtg {visita}: **{ft['drtg_v']:.1f}**"
+    )
+
+    # 1. Proyección completa de plantillas del partido activo
+    plantilla = proyectar_plantilla_partido(
+        equipo_local=local,
+        equipo_visita=visita,
+        pace_esperado=pilares["pace_esperado"],
+        drtg_local=ft["drtg_l"],
+        drtg_visita=ft["drtg_v"],
+        b2b_local=bool(ft["b2b_l"]),
+        b2b_visita=bool(ft["b2b_v"]),
+        bajas_local=bajas_l,
+        bajas_visita=bajas_v,
+        n_sims=4000,
+    )
+
+    st.markdown("#### 🎯 1. Top Selecciones de Player Props del Partido (Mayor Piso P10 en Monte Carlo)")
+    st.dataframe(pd.DataFrame(plantilla["top_props"]), use_container_width=True, hide_index=True)
+
+    # 2. Tablas comparativas de ambos equipos (PTS, REB, AST, 3PM, PRA proyectados)
+    col_pl, col_pv = st.columns(2)
+    for col_ui, eq_name, lista_jug in [
+        (col_pl, f"🏠 {local}", plantilla["jugadores_local"]),
+        (col_pv, f"✈️ {visita}", plantilla["jugadores_visita"]),
+    ]:
+        with col_ui:
+            st.markdown(f"##### Plantilla Estelar: {eq_name}")
+            filas_eq = []
+            for jp in lista_jug:
+                mk = jp["mercados"]
+                filas_eq.append(
+                    {
+                        "Jugador": jp["jugador"],
+                        "Pos": jp["pos"],
+                        "MIN Esp": jp["min_esp"],
+                        "PTS Proy": mk["PTS"]["proyeccion"],
+                        "REB Proy": mk["REB"]["proyeccion"],
+                        "AST Proy": mk["AST"]["proyeccion"],
+                        "3PM Proy": mk["3PM"]["proyeccion"],
+                        "PRA Proy": mk["PRA"]["proyeccion"],
+                        "Mejor Prop": f"{mk['PRA']['recomendacion']} PRA ({mk['PRA']['prob_recomendacion']*100:.0f}%)",
+                    }
+                )
+            st.dataframe(pd.DataFrame(filas_eq), use_container_width=True, hide_index=True)
+
+    # 3. Simulador Individual de Player Props + Calculadora EV+ (Betano / Betsafe)
+    st.markdown("---")
+    st.markdown("#### 🔬 2. Analizador Individual de Jugador & Calculadora EV+ (PTS, REB, AST, 3PM, PRA)")
+
+    todos_equipos = sorted(list(NBA_TEAMS.keys()))
+    c_eq, c_jug, c_opp = st.columns([1.4, 1.6, 1.4])
+    with c_eq:
+        idx_eq_def = todos_equipos.index(local) if local in todos_equipos else 0
+        eq_sel = st.selectbox("Equipo del Jugador", options=todos_equipos, index=idx_eq_def, key="prop_eq_sel")
+    roster_sel = obtener_jugadores_equipo(eq_sel)
+    nombres_sel = [p["jugador"] for p in roster_sel]
+    with c_jug:
+        jug_nombre = st.selectbox("Seleccionar Jugador", options=nombres_sel, index=0, key="prop_jug_sel")
+    with c_opp:
+        idx_opp_def = todos_equipos.index(visita) if (visita in todos_equipos and visita != eq_sel) else 1
+        opp_sel = st.selectbox("Rival Enfrentado", options=todos_equipos, index=idx_opp_def, key="prop_opp_sel")
+
+    jug_obj = next((p for p in roster_sel if p["jugador"] == jug_nombre), roster_sel[0])
+    perf_eq = engine.tracker.obtener_perfil_hibrido(eq_sel, es_local=True)
+    perf_opp = engine.tracker.obtener_perfil_hibrido(opp_sel, es_local=False)
+    pace_cruce = 0.42 * perf_eq["pace"] + 0.42 * perf_opp["pace"] + 0.16 * 99.2
+
+    sim_ind = proyectar_y_simular_jugador(
+        jugador_info=jug_obj,
+        es_local=(eq_sel == local),
+        pace_esperado=pace_cruce,
+        drtg_rival=perf_opp["drtg"],
+        en_b2b=False,
+        n_sims=5000,
+    )
+
+    st.dataframe(pd.DataFrame(sim_ind["tabla_resumen"]), use_container_width=True, hide_index=True)
+
+    # Calculadora rápida EV+ para una línea específica del jugador seleccionado
+    cp1, cp2, cp3 = st.columns(3)
+    with cp1:
+        mkt_prop_code = st.selectbox(
+            "Mercado del Jugador",
+            options=["PTS", "REB", "AST", "3PM", "PRA"],
+            format_func=lambda k: sim_ind["mercados"][k]["etiqueta"],
+            key="prop_mkt_code",
+        )
+    mkt_actual = sim_ind["mercados"][mkt_prop_code]
+    with cp2:
+        linea_prop_usr = st.number_input(
+            f"Línea de Mercado ({mkt_prop_code})",
+            min_value=0.5,
+            max_value=80.5,
+            value=float(mkt_actual["linea"]),
+            step=1.0,
+            key="prop_linea_usr",
+        )
+    with cp3:
+        cuota_prop_usr = st.number_input(
+            "Cuota Casa (Betano / Betsafe)",
+            min_value=1.05,
+            max_value=15.0,
+            value=1.87,
+            step=0.02,
+            key="prop_cuota_usr",
+        )
+
+    sim_custom = proyectar_y_simular_jugador(
+        jugador_info=jug_obj,
+        es_local=(eq_sel == local),
+        pace_esperado=pace_cruce,
+        drtg_rival=perf_opp["drtg"],
+        lineas_custom={mkt_prop_code: float(linea_prop_usr)},
+        n_sims=5000,
+    )
+    m_res = sim_custom["mercados"][mkt_prop_code]
+    ev_over_p = calcular_ev_y_kelly(m_res["prob_over"], cuota_prop_usr, prob_p25=m_res["p10_over"])
+    ev_under_p = calcular_ev_y_kelly(m_res["prob_under"], cuota_prop_usr, prob_p25=m_res["p10_under"])
+
+    co1, co2 = st.columns(2)
+    with co1:
+        st.info(
+            f"📈 **OVER (Más de {linea_prop_usr:.1f} {mkt_prop_code}) — {jug_nombre}**\n"
+            f"- Probabilidad Monte Carlo: **`{m_res['prob_over']*100:.1f}%`** (Piso P10: `{m_res['p10_over']*100:.1f}%`)\n"
+            f"- Cuota Justa: **`{m_res['cuota_justa_over']:.2f}`** | EV: **`{ev_over_p['ev_pct']:+.2f}%`**\n"
+            f"- Stake 1/4 Kelly: `{ev_over_p['stake_kelly_pct']:.2f}%` ({ev_over_p['recomendacion']})"
+        )
+    with co2:
+        st.info(
+            f"📉 **UNDER (Menos de {linea_prop_usr:.1f} {mkt_prop_code}) — {jug_nombre}**\n"
+            f"- Probabilidad Monte Carlo: **`{m_res['prob_under']*100:.1f}%`** (Piso P10: `{m_res['p10_under']*100:.1f}%`)\n"
+            f"- Cuota Justa: **`{m_res['cuota_justa_under']:.2f}`** | EV: **`{ev_under_p['ev_pct']:+.2f}%`**\n"
+            f"- Stake 1/4 Kelly: `{ev_under_p['stake_kelly_pct']:.2f}%` ({ev_under_p['recomendacion']})"
+        )
+
+    # 4. Catálogo Completo de Líderes NBA (PTS, REB, AST, 3PM, PRA)
+    with st.expander("🏆 Ver Catálogo Completo y Ranking de Jugadores NBA (30 Franquicias)", expanded=False):
+        df_cat_jug = obtener_catalogo_completo_jugadores()
+        st.dataframe(df_cat_jug, use_container_width=True, hide_index=True)
+
+
 def render_tab_datos(df_partidos: pd.DataFrame) -> None:
     """Pestaña 6: 🗄️ Datos (Ingesta Multihilo ESPN, Actualización Diaria e Importador CSV/Excel)."""
     st.subheader("🗄️ Gestión de Base de Datos SQLite & Ingesta ESPN NBA (Sin API Keys)")
@@ -1000,6 +1240,7 @@ def main() -> None:
     tabs = st.tabs(
         [
             "🔮 Predicción",
+            "⛹️‍♂️ Jugadores & Props",
             "💹 EV+ & Kelly",
             "🎯 Combinadas",
             "🏅 Ranking NBA",
@@ -1011,14 +1252,16 @@ def main() -> None:
     with tabs[0]:
         render_tab_prediccion(engine, params)
     with tabs[1]:
-        render_tab_ev_kelly(engine, params)
+        render_tab_jugadores(engine, params)
     with tabs[2]:
-        render_tab_combinadas(engine, params)
+        render_tab_ev_kelly(engine, params)
     with tabs[3]:
-        render_tab_power_ranking(engine)
+        render_tab_combinadas(engine, params)
     with tabs[4]:
-        render_tab_backtest(df_partidos, params)
+        render_tab_power_ranking(engine)
     with tabs[5]:
+        render_tab_backtest(df_partidos, params)
+    with tabs[6]:
         render_tab_datos(df_partidos)
 
 

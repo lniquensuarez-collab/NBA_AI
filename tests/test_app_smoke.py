@@ -191,6 +191,7 @@ class TestAppSmoke(unittest.TestCase):
 
             expected_tabs = [
                 "🔮 Predicción",
+                "⛹️‍♂️ Jugadores & Props",
                 "💹 EV+ & Kelly",
                 "🎯 Combinadas",
                 "🏅 Ranking NBA",

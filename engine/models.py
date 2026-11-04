@@ -972,6 +972,8 @@ class NBAEnsembleEngine:
         casa_apuestas: str = "Betano (Pago Anticipado +20 pts / SuperCuotas)",
         n_sims: Optional[int] = None,
         seed: int = 42,
+        ajuste_bajas_spread_local: float = 0.0,
+        ajuste_bajas_total: float = 0.0,
     ) -> Dict[str, Any]:
         """
         Genera la predicción probabilística completa para un cruce `local` vs `visita`:
@@ -1027,8 +1029,10 @@ class NBAEnsembleEngine:
         p_ml_clf = float(np.clip(p_ml_clf, 0.01, 0.99))
 
         # Pesos del Ensemble (45% Posesional/Eficiencia, 30% Four Factors ML, 25% Elo MOV)
-        spread_ensemble = 0.45 * spread_eff + 0.30 * spread_ml + 0.25 * spread_elo
-        total_ensemble = float(pred_pos["total_eff"])
+        spread_ensemble = (
+            0.45 * spread_eff + 0.30 * spread_ml + 0.25 * spread_elo + float(ajuste_bajas_spread_local)
+        )
+        total_ensemble = float(pred_pos["total_eff"]) + float(ajuste_bajas_total)
 
         mu_l_ens = 0.5 * (total_ensemble + spread_ensemble)
         mu_v_ens = 0.5 * (total_ensemble - spread_ensemble)
