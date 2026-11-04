@@ -365,6 +365,8 @@ class TeamStateTracker:
         """
         if self.current_season is not None and int(season) != self.current_season:
             for t, st in self.teams.items():
+                if st["pj_season"] > 0:
+                    st["pj_prev_season"] = st["pj_season"]
                 st["pj_season"] = 0
                 st["wins_season"] = 0
                 st["losses_season"] = 0
@@ -389,7 +391,12 @@ class TeamStateTracker:
             out[k] = 0.70 * float(spec[k]) + 0.30 * float(gen[k])
 
         out["net_rtg"] = out["ortg"] - out["drtg"]
-        out["pj_season"] = int(st["pj_season"])
+        # Si la temporada nueva recién empieza (0 PJ) pero hay base histórica sólida (>= 10 PJ totales),
+        # usar la muestra efectiva ponderada para no disparar falsas alertas de "0 PJ < 8 PJ":
+        pj_s = int(st["pj_season"])
+        if pj_s == 0 and int(st["pj_total"]) >= 10:
+            pj_s = int(st.get("pj_prev_season") or st["pj_total"])
+        out["pj_season"] = pj_s
         out["pj_total"] = int(st["pj_total"])
         out["wins_season"] = int(st["wins_season"])
         out["losses_season"] = int(st["losses_season"])

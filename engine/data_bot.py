@@ -636,7 +636,7 @@ def importar_archivo_usuario(
 
 
 def generar_partidos_sinteticos_nba(
-    n_partidos: int = 360,
+    n_partidos: int = 480,
     temporadas: Optional[List[int]] = None,
     seed: int = 42,
     db_path: Optional[str] = None,
@@ -645,6 +645,7 @@ def generar_partidos_sinteticos_nba(
     Genera un dataset realista y reproducible de partidos NBA (con las 30 franquicias,
     perfiles reales de ataque/defensa/ritmo, efectos de altitud en Denver/Utah, B2B,
     prórrogas y cuotas de mercado realistas) para pruebas sin red o inicialización rápida.
+    Garantiza que las 30 franquicias tengan >= 12 partidos por temporada.
     """
     rng = np.random.default_rng(seed)
     seasons = temporadas or [2025, 2026]
@@ -677,21 +678,18 @@ def generar_partidos_sinteticos_nba(
             perfiles[t] = (ortg_b, drtg_b, pace_b)
 
     partidos: List[Dict[str, Any]] = []
-    per_season = max(30, n_partidos // len(seasons))
+    # Garantizar al menos 180 partidos por temporada (= 12 PJ exactos por equipo en round-robin)
+    per_season = max(180, n_partidos // len(seasons))
 
     for s_idx, season in enumerate(seasons):
         start_date = date(int(season) - 1, 10, 22)
         for i in range(per_season):
             current_date = start_date + timedelta(days=int(i * 150 / per_season))
-            if i < len(teams) * 8:
-                local = teams[i % len(teams)]
-                visita = teams[(i * 7 + 3 + (i // len(teams))) % len(teams)]
-                if local == visita:
-                    visita = teams[(i + 1) % len(teams)]
-            else:
-                local, visita = rng.choice(teams, size=2, replace=False)
-                local = str(local)
-                visita = str(visita)
+            local = teams[i % len(teams)]
+            shift = (i // len(teams)) + 1
+            visita = teams[(i + shift) % len(teams)]
+            if local == visita:
+                visita = teams[(i + 1) % len(teams)]
 
             ortg_l, drtg_l, pace_l = perfiles[local]
             ortg_v, drtg_v, pace_v = perfiles[visita]

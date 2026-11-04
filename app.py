@@ -4,7 +4,7 @@ Aplicación Web Cuantitativa de Predicción Probabilística y Detección de Valo
 en mercados de apuestas de la NBA (Optimizada para Betano y Betsafe).
 """
 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Dict, Any, List, Optional
 import numpy as np
 import pandas as pd
@@ -61,8 +61,8 @@ def _entrenar_motor_base(
     """
     init_db(db_path)
     df = cargar_partidos_df(db_path=db_path)
-    if df.empty or len(df) < 30:
-        generar_partidos_sinteticos_nba(n_partidos=320, temporadas=[2025, 2026], db_path=db_path)
+    if df.empty or len(df) < 360:
+        generar_partidos_sinteticos_nba(n_partidos=480, temporadas=[2025, 2026], db_path=db_path)
         df = cargar_partidos_df(db_path=db_path)
 
     df_feat, tracker, elo_sys = construir_dataset_cronologico(df)
@@ -167,12 +167,23 @@ def render_sidebar() -> Dict[str, Any]:
     }
 
 
+def _generar_opciones_fechas(dias_atras: int = 10, dias_adelante: int = 14) -> List[str]:
+    hoy = datetime.now().date()
+    return [
+        (hoy + timedelta(days=d)).strftime("%Y-%m-%d")
+        for d in range(-dias_atras, dias_adelante + 1)
+    ]
+
+
 def render_tab_prediccion(
     engine: NBAEnsembleEngine, params: Dict[str, Any]
 ) -> None:
     """Pestaña 1: 🔮 Predicción Individual y Mercados Completos (Moneyline, Spread, Totales, Q1/1H)."""
     st.subheader("🔮 Predicción Probabilística & Simulación de Monte Carlo")
     teams_sorted = sorted(list(NBA_TEAMS.keys()))
+    fechas_disp = _generar_opciones_fechas(dias_atras=10, dias_adelante=14)
+    hoy_iso = datetime.now().strftime("%Y-%m-%d")
+    idx_hoy = fechas_disp.index(hoy_iso) if hoy_iso in fechas_disp else 0
 
     col1, col2, col3 = st.columns([2, 2, 1.3])
     with col1:
@@ -182,7 +193,7 @@ def render_tab_prediccion(
         default_visita = teams_sorted.index("Los Angeles Lakers") if "Los Angeles Lakers" in teams_sorted else 1
         visita = st.selectbox("✈️ Equipo Visitante (Away)", options=teams_sorted, index=default_visita, key="pred_visita")
     with col3:
-        fecha_sel = st.date_input("📅 Fecha del Partido", value=datetime.now().date(), key="pred_fecha")
+        fecha_sel = st.selectbox("📅 Fecha del Partido", options=fechas_disp, index=idx_hoy, key="pred_fecha")
 
     if local == visita:
         st.warning("Selecciona dos franquicias NBA distintas para ejecutar la simulación.")
@@ -632,9 +643,13 @@ def render_tab_combinadas(
 
     # 1. Buscador Automático de la Cartelera NBA del Día
     st.markdown("#### 🔎 1. Buscador Automático de la Cartelera NBA del Día (ESPN Live)")
+    fechas_disp = _generar_opciones_fechas(dias_atras=10, dias_adelante=14)
+    hoy_iso = datetime.now().strftime("%Y-%m-%d")
+    idx_hoy = fechas_disp.index(hoy_iso) if hoy_iso in fechas_disp else 0
+
     b1, b2, b3 = st.columns([1.5, 1.5, 1.5])
     with b1:
-        fecha_busqueda = st.date_input("📅 Fecha de Cartelera", value=datetime.now().date(), key="comb_fecha")
+        fecha_busqueda = st.selectbox("📅 Fecha de Cartelera", options=fechas_disp, index=idx_hoy, key="comb_fecha")
     with b2:
         rango_txt = st.selectbox(
             "📆 Rango de Búsqueda",
