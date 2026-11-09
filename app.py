@@ -29,6 +29,7 @@ from engine.data_bot import (
     buscar_cartelera_nba,
     importar_archivo_usuario,
     generar_partidos_sinteticos_nba,
+    parsear_cuotas_rapidas_texto,
 )
 from engine.features import (
     construir_dataset_cronologico,
@@ -554,31 +555,66 @@ def render_tab_ev_kelly(
     pa = pred["pago_anticipado"]
     usa_pa = ("betano" in params["casa_apuestas"].lower()) or ("betsafe" in params["casa_apuestas"].lower())
 
+    if "cuotas_mercado_noche" not in st.session_state:
+        st.session_state["cuotas_mercado_noche"] = {}
+    gkey_ev = f"{local}_{visita}"
+    saved_odds = st.session_state["cuotas_mercado_noche"].get(gkey_ev, {})
+
     st.caption(
         f"Partido activo: **{visita} @ {local}** | Casa seleccionada: **{params['casa_apuestas']}** | "
         f"Banca configurada: **{params['banca']:,.2f}**"
     )
+
+    with st.expander("⚡ Pegado Rápido de Cuotas (Smart-Paste Betano / Betsafe) para este Partido", expanded=False):
+        sp_col1, sp_col2 = st.columns([3, 1.2])
+        with sp_col1:
+            txt_ev_paste = st.text_input(
+                "Pega aquí las cuotas de Betano/Betsafe (ej: `1.20 4.15 227.5 1.53 2.30` o `Warriors 1.20 Pelicans 4.15`)",
+                placeholder=f"{local} 1.45 {visita} 2.80 226.5 1.91 1.91",
+                key=f"smart_paste_ev_{gkey_ev}",
+            )
+        with sp_col2:
+            st.write("")
+            if st.button("⚡ Aplicar Cuotas", use_container_width=True, key=f"btn_paste_ev_{gkey_ev}"):
+                parsed = parsear_cuotas_rapidas_texto(
+                    txt_ev_paste, cartelera=[{"local": local, "visita": visita}]
+                )
+                if gkey_ev in parsed:
+                    p_item = parsed[gkey_ev]
+                    st.session_state["cuotas_mercado_noche"][gkey_ev] = p_item
+                    if "cuota_local" in p_item:
+                        st.session_state[f"ev_cuota_ml_l_{local}_{visita}"] = float(p_item["cuota_local"])
+                    if "cuota_visita" in p_item:
+                        st.session_state[f"ev_cuota_ml_v_{local}_{visita}"] = float(p_item["cuota_visita"])
+                    if "cuota_over" in p_item:
+                        st.session_state[f"ev_cuota_ov_{local}_{visita}"] = float(p_item["cuota_over"])
+                    if "cuota_under" in p_item:
+                        st.session_state[f"ev_cuota_un_{local}_{visita}"] = float(p_item["cuota_under"])
+                    st.success("Cuotas aplicadas y sincronizadas con la pestaña 🎯 Combinadas.")
+                    st.rerun()
 
     col_ml, col_sp, col_tot = st.columns(3)
 
     # 1. Mercado Moneyline (con soporte de Pago Anticipado +20 pts Betano/Betsafe)
     with col_ml:
         st.markdown("#### 🏆 1. Moneyline (Ganador)")
+        def_ml_l = float(saved_odds.get("cuota_local") or round(pa["cuota_justa_pa_local"] * 0.96, 2))
+        def_ml_v = float(saved_odds.get("cuota_visita") or round(pa["cuota_justa_pa_visita"] * 0.96, 2))
         cuota_ml_l = st.number_input(
             f"Cuota Local ({local})",
             min_value=1.01,
             max_value=50.0,
-            value=float(round(pa["cuota_justa_pa_local"] * 1.04, 2)),
+            value=def_ml_l,
             step=0.05,
-            key="ev_cuota_ml_l",
+            key=f"ev_cuota_ml_l_{local}_{visita}",
         )
         cuota_ml_v = st.number_input(
             f"Cuota Visita ({visita})",
             min_value=1.01,
             max_value=50.0,
-            value=float(round(pa["cuota_justa_pa_visita"] * 1.04, 2)),
+            value=def_ml_v,
             step=0.05,
-            key="ev_cuota_ml_v",
+            key=f"ev_cuota_ml_v_{local}_{visita}",
         )
 
         p_l_use = pa["p_efectiva_local"] if usa_pa else mc["moneyline"]["prob_local"]
@@ -610,7 +646,7 @@ def render_tab_ev_kelly(
             options=lineas_disp,
             index=default_sp_idx,
             format_func=lambda x: f"{local} {x:+.1f} / {visita} {-x:+.1f}",
-            key="ev_linea_sp",
+            key=f"ev_linea_sp_{local}_{visita}",
         )
         row_sp = next(r for r in mc["spread"]["tabla"] if r["linea"] == linea_sp_sel)
 
@@ -620,7 +656,7 @@ def render_tab_ev_kelly(
             max_value=25.0,
             value=1.91,
             step=0.02,
-            key="ev_cuota_sp_l",
+            key=f"ev_cuota_sp_l_{local}_{visita}",
         )
         cuota_sp_v = st.number_input(
             f"Cuota {visita} {-linea_sp_sel:+.1f}",
@@ -628,7 +664,7 @@ def render_tab_ev_kelly(
             max_value=25.0,
             value=1.91,
             step=0.02,
-            key="ev_cuota_sp_v",
+            key=f"ev_cuota_sp_v_{local}_{visita}",
         )
 
         ev_sp_l = calcular_ev_y_kelly(row_sp["prob_local"], cuota_sp_l, prob_p25=row_sp["p25_local"])
@@ -655,25 +691,27 @@ def render_tab_ev_kelly(
             options=lineas_tot_disp,
             index=len(lineas_tot_disp) // 2,
             format_func=lambda x: f"{x:.1f} puntos",
-            key="ev_linea_tot",
+            key=f"ev_linea_tot_{local}_{visita}",
         )
         row_tot = next(r for r in mc["totales"]["tabla"] if r["linea"] == linea_tot_sel)
 
+        def_ov = float(saved_odds.get("cuota_over") or 1.91)
+        def_un = float(saved_odds.get("cuota_under") or 1.91)
         cuota_ov = st.number_input(
             f"Cuota Over (Más de {linea_tot_sel:.1f})",
             min_value=1.01,
             max_value=25.0,
-            value=1.91,
+            value=def_ov,
             step=0.02,
-            key="ev_cuota_ov",
+            key=f"ev_cuota_ov_{local}_{visita}",
         )
         cuota_un = st.number_input(
             f"Cuota Under (Menos de {linea_tot_sel:.1f})",
             min_value=1.01,
             max_value=25.0,
-            value=1.91,
+            value=def_un,
             step=0.02,
-            key="ev_cuota_un",
+            key=f"ev_cuota_un_{local}_{visita}",
         )
 
         ev_ov = calcular_ev_y_kelly(row_tot["prob_over"], cuota_ov, prob_p25=row_tot["p25_over"])
@@ -691,15 +729,28 @@ def render_tab_ev_kelly(
                 f"- {ev_obj['recomendacion']}"
             )
 
+    # Sincronizar automáticamente las cuotas del partido activo en session_state para la pestaña Combinadas
+    st.session_state["cuotas_mercado_noche"][gkey_ev] = {
+        "cuota_local": round(float(cuota_ml_l), 2),
+        "cuota_visita": round(float(cuota_ml_v), 2),
+        "linea_total": round(float(linea_tot_sel), 1),
+        "cuota_over": round(float(cuota_ov), 2),
+        "cuota_under": round(float(cuota_un), 2),
+    }
+
 
 def render_tab_combinadas(
     engine: NBAEnsembleEngine, params: Dict[str, Any]
 ) -> None:
     """
     Pestaña 3: 🎯 Combinadas + Buscador Automático de la Cartelera NBA del Día
-    + Armador de Combinadas Seguras (Doble/Triple) + 🌶️ Zona Picante (Cuota 5.00+).
+    + Panel Rápido de Cuotas Reales (Opción C: Tabla Editable & Smart-Paste)
+    + Optimizador Knapsack EV+ + Detector Anti-Piernas Tóxicas + 🌶️ Zona Picante (Cuota 5.00+).
     """
-    st.subheader("🎯 Escáner de la Noche NBA, Combinadas Seguras & 🌶️ Zona Picante (Cuota 5.00+)")
+    st.subheader("🎯 Escáner de la Noche NBA, Optimizador EV+ de Combinadas & 🌶️ Zona Picante (5.00+)")
+
+    if "cuotas_mercado_noche" not in st.session_state:
+        st.session_state["cuotas_mercado_noche"] = {}
 
     # Inicializar cartelera por defecto en session_state
     if "cartelera_activa" not in st.session_state or not st.session_state["cartelera_activa"]:
@@ -739,6 +790,16 @@ def render_tab_combinadas(
             )
             if encontrados:
                 st.session_state["cartelera_activa"] = encontrados
+                # Pre-cargar cuotas de consenso ESPN si vienen en el JSON
+                for enc in encontrados:
+                    gk = f"{enc['local']}_{enc['visita']}"
+                    entry_c = st.session_state["cuotas_mercado_noche"].setdefault(gk, {})
+                    if enc.get("cuota_l"):
+                        entry_c["cuota_local"] = float(enc["cuota_l"])
+                    if enc.get("cuota_v"):
+                        entry_c["cuota_visita"] = float(enc["cuota_v"])
+                    if enc.get("total_linea"):
+                        entry_c["linea_total"] = float(enc["total_linea"])
                 fechas_enc = sorted({str(x.get("fecha", "")) for x in encontrados})
                 if str(fecha_busqueda) in fechas_enc:
                     st.success(f"Se cargaron {len(encontrados)} partidos oficiales desde ESPN NBA ({', '.join(fechas_enc)}).")
@@ -774,12 +835,12 @@ def render_tab_combinadas(
         st.info("Agrega al menos 2 partidos a la cartelera o pulsa 'Buscar Partidos en ESPN NBA'.")
         return
 
-    # Analizar todos los partidos de la noche (con caché en session_state para navegación instantánea)
-    combo_cache_key = (
+    # Pre-calcular las predicciones de Monte Carlo de la noche (cacheadas por cruces y parámetros)
+    preds_cache_key = (
         str([(g.get("local"), g.get("visita"), g.get("fecha")) for g in cartelera])
         + f"_{params['casa_apuestas']}_{params['half_life']}_{params['n_sims']}"
     )
-    if st.session_state.get("combo_cache_key") != combo_cache_key or "ultimo_res_combos" not in st.session_state:
+    if st.session_state.get("preds_noche_key") != preds_cache_key or "preds_noche_list" not in st.session_state:
         predicciones_noche: List[Dict[str, Any]] = []
         for idx_g, g in enumerate(cartelera):
             loc_g = normalizar_equipo(g.get("local"))
@@ -795,34 +856,171 @@ def render_tab_combinadas(
                 seed=42 + idx_g,
             )
             predicciones_noche.append(p_g)
+        st.session_state["preds_noche_list"] = predicciones_noche
+        st.session_state["preds_noche_key"] = preds_cache_key
 
-        st.session_state["ultimo_res_combos"] = armar_combinadas_y_zona_picante(
-            predicciones_noche, casa_apuestas=params["casa_apuestas"]
+    predicciones_noche = st.session_state["preds_noche_list"]
+    if not predicciones_noche:
+        st.warning("No hay partidos válidos en la cartelera.")
+        return
+
+    # =========================================================================
+    # 💹 PANEL RÁPIDO DE CUOTAS DE MERCADO (OPCIÓN C: TABLA EDITABLE + SMART-PASTE)
+    # =========================================================================
+    st.markdown("#### 💹 2. Cuotas Reales de Betano / Betsafe para Optimizar Combinadas (Opción C)")
+    with st.expander("📋 Ingreso Rápido de Cuotas de la Jornada (Tabla Editable en 1 Clic o Pegado Inteligente)", expanded=True):
+        st.caption(
+            "Edita directamente las celdas con las cuotas reales de **Betano / Betsafe** (o pega el texto abajo). "
+            "El motor recalculará al instante el **EV% Compuesto del Boleto**, filtrará **Piernas Tóxicas** y hallará la mejor combinada."
         )
-        st.session_state["combo_cache_key"] = combo_cache_key
+        cp_txt, cp_btn = st.columns([3.2, 1.2])
+        with cp_txt:
+            smart_paste_slate = st.text_area(
+                "⚡ Pegado Inteligente (Opcional: una línea por partido, ej: `Celtics 1.42 Knicks 2.95` o `Warriors 1.20 Pelicans 4.15 227.5 1.53 2.30`)",
+                height=68,
+                placeholder="Boston 1.45 Knicks 2.80\nNuggets 1.62 Lakers 2.35",
+                key="smart_paste_slate_input",
+            )
+        with cp_btn:
+            st.write("")
+            if st.button("⚡ Procesar Texto Pegado", use_container_width=True, key="btn_parse_slate"):
+                parsed_slate = parsear_cuotas_rapidas_texto(smart_paste_slate, cartelera=cartelera)
+                if parsed_slate:
+                    for gk_p, val_p in parsed_slate.items():
+                        st.session_state["cuotas_mercado_noche"].setdefault(gk_p, {}).update(val_p)
+                    st.success(f"¡Se actualizaron las cuotas de {len(parsed_slate)} partido(s)!")
+                    st.rerun()
+                else:
+                    st.warning("No se detectaron cuotas válidas en el texto. Usa el formato `Equipo 1.45 Rival 2.80`.")
 
-    res_combos = st.session_state["ultimo_res_combos"]
+        # Construir tabla editable con valores actuales o valores base de mercado
+        usa_pa = ("betano" in params["casa_apuestas"].lower()) or ("betsafe" in params["casa_apuestas"].lower())
+        filas_editor = []
+        for p_g in predicciones_noche:
+            loc_g = p_g["local"]
+            vis_g = p_g["visita"]
+            gk = f"{loc_g}_{vis_g}"
+            pa_g = p_g["pago_anticipado"]
+            mc_g = p_g["monte_carlo"]
+            pick_seg = p_g["bajo_riesgo"][0]
+            guardadas = st.session_state["cuotas_mercado_noche"].get(gk, {})
 
-    # 2. Ranking de Seguridad de la Noche
-    st.markdown("#### 🛡️ 2. Ranking de Seguridad de la Noche (Con Detector de Fatiga B2B y Consenso)")
+            justa_l = pa_g["cuota_justa_pa_local"] if usa_pa else mc_g["moneyline"]["cuota_justa_local"]
+            justa_v = pa_g["cuota_justa_pa_visita"] if usa_pa else mc_g["moneyline"]["cuota_justa_visita"]
+            lin_tot_def = float(mc_g["totales"]["linea_central"])
+
+            c_loc_val = float(guardadas.get("cuota_local") or round(max(1.05, justa_l * 0.96), 2))
+            c_vis_val = float(guardadas.get("cuota_visita") or round(max(1.05, justa_v * 0.96), 2))
+            l_tot_val = float(guardadas.get("linea_total") or lin_tot_def)
+            c_ov_val = float(guardadas.get("cuota_over") or 1.91)
+            c_un_val = float(guardadas.get("cuota_under") or 1.91)
+
+            filas_editor.append(
+                {
+                    "Partido": f"{vis_g} @ {loc_g}",
+                    "_gkey": gk,
+                    "Cuota Local (ML)": c_loc_val,
+                    "Cuota Visita (ML)": c_vis_val,
+                    "Línea Total": l_tot_val,
+                    "Cuota Over": c_ov_val,
+                    "Cuota Under": c_un_val,
+                    "Cuota Justa Local": justa_l,
+                    "Cuota Justa Visita": justa_v,
+                    "Pick Base Seguro": f"{pick_seg['mercado']} (Justa {pick_seg['cuota_justa']:.2f})",
+                }
+            )
+
+        df_editor_in = pd.DataFrame(filas_editor)
+        if hasattr(st, "data_editor"):
+            df_editado = st.data_editor(
+                df_editor_in.drop(columns=["_gkey"]),
+                use_container_width=True,
+                hide_index=True,
+                disabled=["Partido", "Cuota Justa Local", "Cuota Justa Visita", "Pick Base Seguro"],
+                key="editor_cuotas_combinadas",
+            )
+            for idx_r, row_e in df_editado.iterrows():
+                gk_row = filas_editor[idx_r]["_gkey"]
+                st.session_state["cuotas_mercado_noche"][gk_row] = {
+                    "cuota_local": round(float(row_e["Cuota Local (ML)"]), 2),
+                    "cuota_visita": round(float(row_e["Cuota Visita (ML)"]), 2),
+                    "linea_total": round(float(row_e["Línea Total"]), 1),
+                    "cuota_over": round(float(row_e["Cuota Over"]), 2),
+                    "cuota_under": round(float(row_e["Cuota Under"]), 2),
+                }
+
+        # Selector de rango de cuota objetivo para el Optimizador Knapsack
+        ko1, ko2, ko3 = st.columns([1.8, 1.1, 1.1])
+        with ko1:
+            preset_rango = st.selectbox(
+                "🎯 Objetivo de Cuota Real para el Optimizador Knapsack",
+                options=[
+                    "Doble Clásica de Valor (Cuota 1.75 a 2.50)",
+                    "Triple / Multiplicador Medio (Cuota 2.50 a 4.20)",
+                    "Zona Picante EV+ (Cuota 4.50 a 10.00)",
+                    "Personalizado",
+                ],
+                index=0,
+                key="knapsack_preset",
+            )
+        if preset_rango.startswith("Doble"):
+            def_min, def_max = 1.75, 2.50
+        elif preset_rango.startswith("Triple"):
+            def_min, def_max = 2.50, 4.20
+        elif preset_rango.startswith("Zona"):
+            def_min, def_max = 4.50, 10.00
+        else:
+            def_min, def_max = 1.80, 3.20
+
+        with ko2:
+            c_obj_min = st.number_input("Cuota Mínima Buscada", min_value=1.20, max_value=20.0, value=def_min, step=0.10, key="k_min")
+        with ko3:
+            c_obj_max = st.number_input("Cuota Máxima Buscada", min_value=1.30, max_value=30.0, value=max(def_max, c_obj_min + 0.20), step=0.10, key="k_max")
+
+    # Ejecutar el optimizador de combinadas con las cuotas reales de la sesión
+    res_combos = armar_combinadas_y_zona_picante(
+        predicciones_noche,
+        casa_apuestas=params["casa_apuestas"],
+        cuotas_mercado=st.session_state["cuotas_mercado_noche"],
+        cuota_objetivo_min=float(c_obj_min),
+        cuota_objetivo_max=float(c_obj_max),
+    )
+    st.session_state["ultimo_res_combos"] = res_combos
+
+    # Alerta de Piernas Tóxicas detectadas en la jornada
+    toxicas_list = res_combos.get("piernas_toxicas", [])
+    if toxicas_list:
+        with st.expander(f"⚠️ Alerta Anti-Trampa: {len(toxicas_list)} Pierna(s) Tóxica(s) Detectada(s) y Excluidas de tus Combinadas", expanded=True):
+            for tx in toxicas_list[:4]:
+                st.error(
+                    f"⛔ **Pierna Tóxica en {tx['partido']} → `{tx['mercado']}`**: "
+                    f"Aunque tiene `{tx['probabilidad']*100:.1f}%` de probabilidad, su Cuota Justa es **`{tx['cuota_justa']:.2f}`** "
+                    f"pero la casa solo paga **`{tx['cuota_casa']:.2f}`** (**EV: `{tx['ev_individual_pct']:+.2f}%`**). "
+                    f"Incluirla destruye el valor matemático de cualquier combinada."
+                )
+
+    # 3. Ranking de Seguridad y Valor de la Noche
+    st.markdown("#### 🛡️ 3. Ranking de Seguridad y Valor de la Noche (Con EV% Real, Fatiga B2B y Consenso)")
     df_rank_seg = pd.DataFrame(res_combos["ranking_seguridad"])
     if not df_rank_seg.empty:
         df_rank_view = pd.DataFrame(
             {
                 "Partido": df_rank_seg["partido"],
-                "Selección Más Segura": df_rank_seg["seleccion_principal"],
+                "Selección Óptima": df_rank_seg["seleccion_principal"],
                 "Categoría": df_rank_seg["categoria"],
-                "Probabilidad %": (df_rank_seg["probabilidad"] * 100).round(1),
+                "Prob %": (df_rank_seg["probabilidad"] * 100).round(1),
                 "Piso P10 %": (df_rank_seg["piso_p10"] * 100).round(1),
                 "Cuota Justa": df_rank_seg["cuota_justa"],
+                "Cuota Casa": df_rank_seg["cuota_casa"],
+                "EV Indiv. %": df_rank_seg["ev_individual_pct"].map(lambda v: f"{v:+.2f}%"),
                 "Fatiga / Altitud": df_rank_seg["alerta_fatiga"],
                 "Consenso": df_rank_seg["estado_consenso"],
             }
         )
         st.dataframe(df_rank_view, use_container_width=True, hide_index=True)
 
-    # 3. Mejor Combinada Doble y Mejor Combinada Triple
-    st.markdown("#### 🏆 3. Armador Automático de Combinadas Principales (Sin Partidos Trampa)")
+    # 4. Mejor Combinada Doble y Mejor Combinada Triple (Optimizada con Cuotas Reales)
+    st.markdown("#### 🏆 4. Combinadas Principales Optimizadas (Con Cálculo de EV+ Compuesto del Boleto)")
     cd1, cd2 = st.columns(2)
     with cd1:
         doble = res_combos["mejor_doble"]
@@ -831,13 +1029,17 @@ def render_tab_combinadas(
             for s in doble["selecciones"]:
                 st.write(
                     f"- **{s['partido']}** → `{s['mercado']}` "
-                    f"(`{s['probabilidad']*100:.1f}%` | P10 `{s['piso_p10']*100:.1f}%` | Cuota `{s['cuota_individual']:.2f}`)"
+                    f"(Prob `{s['probabilidad']*100:.1f}%` | P10 `{s['piso_p10']*100:.1f}%` | "
+                    f"Casa **`{s['cuota_casa']:.2f}`** vs Justa `{s['cuota_justa']:.2f}` | EV `{s['ev_individual_pct']:+.1f}%`)"
                 )
+            monto_doble = (doble["stake_kelly_pct"] / 100.0) * params["banca"]
             st.markdown(
                 f"**Probabilidad Conjunta:** `{doble['probabilidad_conjunta']*100:.1f}%` "
                 f"(Piso P10 Conjunto: `{doble['piso_p10_conjunto']*100:.1f}%`)  \n"
-                f"**Cuota Justa Combinada:** **`{doble['cuota_combinada']:.2f}`** "
-                f"(Paga **`{doble['retorno_por_10u']:.2f} u`** por cada `10 u`)"
+                f"💰 **Cuota Total Casa:** **`{doble['cuota_casa_combinada']:.2f}`** "
+                f"(Cuota Justa Modelo: `{doble['cuota_justa_combinada']:.2f}`)  \n"
+                f"📈 **EV+ Compuesto del Boleto:** **`{doble['ev_boleto_pct']:+.2f}%`** | "
+                f"**Stake 1/4 Kelly:** `{doble['stake_kelly_pct']:.2f}%` (**`{monto_doble:,.2f}`**)"
             )
         else:
             st.warning("Se necesitan al menos 2 partidos seguros (sin alerta de Partido Trampa) para armar la Doble.")
@@ -849,18 +1051,60 @@ def render_tab_combinadas(
             for s in triple["selecciones"]:
                 st.write(
                     f"- **{s['partido']}** → `{s['mercado']}` "
-                    f"(`{s['probabilidad']*100:.1f}%` | P10 `{s['piso_p10']*100:.1f}%` | Cuota `{s['cuota_individual']:.2f}`)"
+                    f"(Prob `{s['probabilidad']*100:.1f}%` | P10 `{s['piso_p10']*100:.1f}%` | "
+                    f"Casa **`{s['cuota_casa']:.2f}`** vs Justa `{s['cuota_justa']:.2f}` | EV `{s['ev_individual_pct']:+.1f}%`)"
                 )
+            monto_triple = (triple["stake_kelly_pct"] / 100.0) * params["banca"]
             st.markdown(
                 f"**Probabilidad Conjunta:** `{triple['probabilidad_conjunta']*100:.1f}%` "
                 f"(Piso P10 Conjunto: `{triple['piso_p10_conjunto']*100:.1f}%`)  \n"
-                f"**Cuota Justa Combinada:** **`{triple['cuota_combinada']:.2f}`** "
-                f"(Paga **`{triple['retorno_por_10u']:.2f} u`** por cada `10 u`)"
+                f"💰 **Cuota Total Casa:** **`{triple['cuota_casa_combinada']:.2f}`** "
+                f"(Cuota Justa Modelo: `{triple['cuota_justa_combinada']:.2f}`)  \n"
+                f"📈 **EV+ Compuesto del Boleto:** **`{triple['ev_boleto_pct']:+.2f}%`** | "
+                f"**Stake 1/4 Kelly:** `{triple['stake_kelly_pct']:.2f}%` (**`{monto_triple:,.2f}`**)"
             )
         else:
             st.warning("Se necesitan al menos 3 partidos seguros (sin alerta de Partido Trampa) para armar la Triple.")
 
-    # 4. 🌶️ Zona Picante: El Boleto de Cuota 5.00+
+    # 5. Optimizador Knapsack por Cuota Objetivo
+    knap = res_combos.get("optimizador_knapsack") or {}
+    b_ev = knap.get("boleto_optimo_ev")
+    b_seg = knap.get("boleto_mas_seguro")
+    if b_ev or b_seg:
+        st.markdown(
+            f"#### 💎 5. Recomendación del Algoritmo Knapsack para Cuota Objetivo (`{knap.get('rango_min', 1.80):.2f}` – `{knap.get('rango_max', 2.80):.2f}`)"
+        )
+        ck1, ck2 = st.columns(2)
+        with ck1:
+            if b_ev:
+                st.success(f"**{b_ev['titulo']}**")
+                for s in b_ev["selecciones"]:
+                    st.write(
+                        f"- **{s['partido']}** → `{s['mercado']}` "
+                        f"(Prob `{s['probabilidad']*100:.1f}%` | Casa **`{s['cuota_casa']:.2f}`** vs Justa `{s['cuota_justa']:.2f}` | EV `{s['ev_individual_pct']:+.1f}%`)"
+                    )
+                st.markdown(
+                    f"💰 **Cuota Real Combinada:** **`{b_ev['cuota_casa_combinada']:.2f}`** (Justa: `{b_ev['cuota_justa_combinada']:.2f}`)  \n"
+                    f"📈 **EV+ del Boleto:** **`{b_ev['ev_boleto_pct']:+.2f}%`** | "
+                    f"📊 **Prob. Conjunta:** `{b_ev['probabilidad_conjunta']*100:.1f}%`  \n"
+                    f"💵 **Retorno por 10u en Betano/Betsafe:** **`{b_ev['retorno_casa_por_10u']:.2f} u`**"
+                )
+        with ck2:
+            if b_seg:
+                st.info(f"**{b_seg['titulo']}**")
+                for s in b_seg["selecciones"]:
+                    st.write(
+                        f"- **{s['partido']}** → `{s['mercado']}` "
+                        f"(Prob `{s['probabilidad']*100:.1f}%` | P10 `{s['piso_p10']*100:.1f}%` | Casa **`{s['cuota_casa']:.2f}`**)"
+                    )
+                st.markdown(
+                    f"💰 **Cuota Real Combinada:** **`{b_seg['cuota_casa_combinada']:.2f}`** (Justa: `{b_seg['cuota_justa_combinada']:.2f}`)  \n"
+                    f"🛡️ **Piso P10 Conjunto:** **`{b_seg['piso_p10_conjunto']*100:.1f}%`** | "
+                    f"📈 **EV+ del Boleto:** `{b_seg['ev_boleto_pct']:+.2f}%`  \n"
+                    f"💵 **Retorno por 10u en Betano/Betsafe:** **`{b_seg['retorno_casa_por_10u']:.2f} u`**"
+                )
+
+    # 6. 🌶️ Zona Picante: El Boleto de Cuota 5.00+
     st.markdown("---")
     st.markdown("### 🌶️ Zona Picante: El Boleto de Cuota 5.00+ (Juego Recreativo / Cash Rápido)")
     st.caption(
@@ -877,10 +1121,10 @@ def render_tab_combinadas(
             for s in esc["selecciones"]:
                 st.write(
                     f"- **{s['partido']}** → `{s['mercado']}` "
-                    f"(Prob: `{s['probabilidad']*100:.1f}%` | Cuota: `{s['cuota_individual']:.2f}`)"
+                    f"(Prob: `{s['probabilidad']*100:.1f}%` | Cuota Justa: `{s['cuota_individual']:.2f}` | Casa: `{s.get('cuota_casa', s['cuota_individual']):.2f}`)"
                 )
             st.markdown(
-                f"🔥 **Cuota Combinada Total:** **`{esc['cuota_combinada']:.2f}`**  \n"
+                f"🔥 **Cuota Combinada Total:** **`{esc['cuota_combinada']:.2f}`** (Casa est.: `{esc.get('cuota_casa_combinada', esc['cuota_combinada']):.2f}`)  \n"
                 f"📊 **Probabilidad Conjunta:** `{esc['probabilidad_conjunta']*100:.1f}%`  \n"
                 f"💵 **Retorno por cada 10 unidades apostadas:** **`{esc['retorno_por_10u']:.2f} u`**"
             )
@@ -891,10 +1135,10 @@ def render_tab_combinadas(
             for s in bomba["selecciones"]:
                 st.write(
                     f"- **{s['partido']}** → `{s['mercado']}` "
-                    f"(Prob: `{s['probabilidad']*100:.1f}%` | Cuota: `{s['cuota_individual']:.2f}`)"
+                    f"(Prob: `{s['probabilidad']*100:.1f}%` | Cuota Justa: `{s['cuota_individual']:.2f}` | Casa: `{s.get('cuota_casa', s['cuota_individual']):.2f}`)"
                 )
             st.markdown(
-                f"💣 **Cuota Combinada Total:** **`{bomba['cuota_combinada']:.2f}`**  \n"
+                f"💣 **Cuota Combinada Total:** **`{bomba['cuota_combinada']:.2f}`** (Casa est.: `{bomba.get('cuota_casa_combinada', bomba['cuota_combinada']):.2f}`)  \n"
                 f"📊 **Probabilidad Conjunta:** `{bomba['probabilidad_conjunta']*100:.1f}%`  \n"
                 f"💵 **Retorno por cada 10 unidades apostadas:** **`{bomba['retorno_por_10u']:.2f} u`**"
             )

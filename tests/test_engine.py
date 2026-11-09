@@ -42,6 +42,7 @@ from engine.db import (
 from engine.data_bot import (
     generar_partidos_sinteticos_nba,
     importar_archivo_usuario,
+    parsear_cuotas_rapidas_texto,
 )
 from engine.elo_system import (
     EloSystemNBA,
@@ -291,7 +292,50 @@ class TestNBAUltimateEngine(unittest.TestCase):
 
         plantilla = proyectar_plantilla_partido("Boston Celtics", "Los Angeles Lakers", n_sims=2000, db_path=self.db_path)
         self.assertGreaterEqual(len(plantilla["top_props"]), 5)
-        print("✅ [8/8] Estadísticas de Jugadores SQLite/ESPN, Racha L5, Player Props y Simulador de Bajas verificados.")
+        print("✅ [8/9] Estadísticas de Jugadores SQLite/ESPN, Racha L5, Player Props y Simulador de Bajas verificados.")
+
+    def test_09_optimizador_combinadas_cuotas_reales_y_smart_paste(self) -> None:
+        cartelera_test = [
+            {"local": "Boston Celtics", "visita": "Indiana Pacers"},
+            {"local": "Denver Nuggets", "visita": "Phoenix Suns"},
+            {"local": "Oklahoma City Thunder", "visita": "Dallas Mavericks"},
+        ]
+        texto_pegado = (
+            "Celtics 1.12 Pacers 6.50 232.5 1.95 1.88\n"
+            "Nuggets 1.65 Suns 2.40\n"
+            "OKC 1.58 Mavericks 2.55"
+        )
+        parsed = parsear_cuotas_rapidas_texto(texto_pegado, cartelera=cartelera_test)
+        self.assertIn("Boston Celtics_Indiana Pacers", parsed)
+        self.assertAlmostEqual(parsed["Boston Celtics_Indiana Pacers"]["cuota_local"], 1.12, places=2)
+        self.assertAlmostEqual(parsed["Boston Celtics_Indiana Pacers"]["linea_total"], 232.5, places=1)
+        self.assertAlmostEqual(parsed["Denver Nuggets_Phoenix Suns"]["cuota_local"], 1.65, places=2)
+
+        generar_partidos_sinteticos_nba(n_partidos=240, temporadas=[2026], db_path=self.db_path)
+        df = cargar_partidos_df(db_path=self.db_path)
+        df_feat, tracker, elo_sys = construir_dataset_cronologico(df)
+        engine = NBAEnsembleEngine(half_life=120.0, n_sims=3000)
+        engine.tracker = tracker
+        engine.elo_sys = elo_sys
+        engine.fit(df, df_features_precomputed=df_feat)
+
+        jornada = [
+            engine.predecir_partido_completo("Boston Celtics", "Indiana Pacers", "2026-03-20", n_sims=3000, seed=11),
+            engine.predecir_partido_completo("Denver Nuggets", "Phoenix Suns", "2026-03-20", n_sims=3000, seed=12),
+            engine.predecir_partido_completo("Oklahoma City Thunder", "Dallas Mavericks", "2026-03-20", n_sims=3000, seed=13),
+        ]
+        combos_opt = armar_combinadas_y_zona_picante(
+            jornada,
+            cuotas_mercado=parsed,
+            cuota_objetivo_min=1.80,
+            cuota_objetivo_max=3.20,
+        )
+        self.assertIn("optimizador_knapsack", combos_opt)
+        self.assertIsNotNone(combos_opt["optimizador_knapsack"]["boleto_optimo_ev"])
+        self.assertGreaterEqual(len(combos_opt["piernas_toxicas"]), 1)
+        self.assertIn("ev_boleto_pct", combos_opt["mejor_doble"])
+        self.assertIn("cuota_casa_combinada", combos_opt["mejor_doble"])
+        print("✅ [9/9] Smart-Paste, Detector de Piernas Tóxicas y Optimizador Knapsack EV+ de Combinadas verificados.")
 
 
 if __name__ == "__main__":

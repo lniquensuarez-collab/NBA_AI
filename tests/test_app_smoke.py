@@ -50,6 +50,15 @@ class _DummyContext:
     def button(self, label, **kwargs):
         return False
 
+    def text_input(self, label, value="", **kwargs):
+        return value
+
+    def text_area(self, label, value="", **kwargs):
+        return value
+
+    def data_editor(self, df, **kwargs):
+        return df
+
     def file_uploader(self, label, **kwargs):
         return None
 
@@ -153,6 +162,15 @@ class _MockStreamlit:
 
     def button(self, label, **kwargs):
         return False
+
+    def text_input(self, label, value="", **kwargs):
+        return value
+
+    def text_area(self, label, value="", **kwargs):
+        return value
+
+    def data_editor(self, df, **kwargs):
+        return df
 
     def file_uploader(self, label, **kwargs):
         return None

@@ -12,7 +12,7 @@ Módulo de Ingesta de Datos para NBA ULTIMATE AI (`engine/data_bot.py`):
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, date
 import io
-from typing import List, Dict, Any, Optional, Union, Callable
+from typing import List, Dict, Any, Optional, Union, Callable, Tuple
 import numpy as np
 import pandas as pd
 import requests
@@ -78,6 +78,21 @@ def _parse_stat_pair(val: str) -> tuple[float, float]:
     except Exception:
         pass
     return 0.0, 0.0
+
+
+def _american_to_decimal(odd_val: Any) -> Optional[float]:
+    """Convierte cuota americana (ej. -150, +135) o decimal (1.65) a formato decimal europeo."""
+    try:
+        val = float(str(odd_val).replace("+", "").strip())
+        if 1.01 <= val <= 45.0:
+            return round(val, 2)
+        if val >= 100.0:
+            return round(1.0 + (val / 100.0), 2)
+        if val <= -100.0:
+            return round(1.0 + (100.0 / abs(val)), 2)
+    except Exception:
+        pass
+    return None
 
 
 def _extraer_estadisticas_competitor(comp: Dict[str, Any]) -> Dict[str, float]:
@@ -457,18 +472,29 @@ def buscar_cartelera_nba(
 
                 spread_linea = None
                 total_linea = None
+                cuota_l = None
+                cuota_v = None
                 odds_list = comp.get("odds") or []
                 if odds_list and isinstance(odds_list[0], dict):
-                    if odds_list[0].get("spread") is not None:
+                    odd0 = odds_list[0]
+                    if odd0.get("spread") is not None:
                         try:
-                            spread_linea = float(odds_list[0]["spread"])
+                            spread_linea = float(odd0["spread"])
                         except Exception:
                             pass
-                    if odds_list[0].get("overUnder") is not None:
+                    if odd0.get("overUnder") is not None:
                         try:
-                            total_linea = float(odds_list[0]["overUnder"])
+                            total_linea = float(odd0["overUnder"])
                         except Exception:
                             pass
+                    home_odds_obj = odd0.get("homeTeamOdds") or {}
+                    away_odds_obj = odd0.get("awayTeamOdds") or {}
+                    ml_h = home_odds_obj.get("moneyLine")
+                    ml_a = away_odds_obj.get("moneyLine")
+                    if ml_h is not None:
+                        cuota_l = _american_to_decimal(ml_h)
+                    if ml_a is not None:
+                        cuota_v = _american_to_decimal(ml_a)
 
                 cartelera.append(
                     {
@@ -479,6 +505,8 @@ def buscar_cartelera_nba(
                         "estado": estado,
                         "spread_linea": spread_linea,
                         "total_linea": total_linea,
+                        "cuota_l": cuota_l,
+                        "cuota_v": cuota_v,
                     }
                 )
         except Exception:
@@ -758,3 +786,135 @@ def generar_partidos_sinteticos_nba(
         guardar_partidos(partidos, db_path=db_path)
 
     return partidos
+
+
+def parsear_cuotas_rapidas_texto(
+    texto: str,
+    cartelera: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Dict[str, float]]:
+    """
+    Smart-Paste Parser (Opción C):
+    Analiza texto libre pegado por el usuario desde Betano / Betsafe o ingresado rápidamente,
+    por ejemplo:
+      - "Boston Celtics 1.42 vs New York Knicks 2.95"
+      - "BOS 1.45 NYK 2.80 O 225.5 1.91 U 1.91"
+      - "Lakers 2.15 Nuggets 1.72"
+      - O líneas ordenadas correspondientes a los partidos de la cartelera con números decimales.
+    Retorna un diccionario indexado por `f"{local}_{visita}"` con las cuotas detectadas:
+      `{"cuota_local": float, "cuota_visita": float, "linea_total": float, "cuota_over": float, "cuota_under": float}`
+    """
+    import re
+
+    out: Dict[str, Dict[str, float]] = {}
+    if not texto or not str(texto).strip():
+        return out
+
+    cartelera_list = cartelera or []
+    # Crear índice de búsqueda de equipos a cruces activos de la cartelera
+    team_to_game_key: Dict[str, Tuple[str, str]] = {}
+    for g in cartelera_list:
+        loc = normalizar_equipo(g.get("local"))
+        vis = normalizar_equipo(g.get("visita"))
+        if loc and vis:
+            gkey = f"{loc}_{vis}"
+            team_to_game_key[loc] = (gkey, "local")
+            team_to_game_key[vis] = (gkey, "visita")
+
+    # Mapa de tokens/alias a nombre canónico de franquicia
+    token_map: Dict[str, str] = {}
+    for canon_name, meta in NBA_TEAMS.items():
+        token_map[canon_name.lower()] = canon_name
+        token_map[meta["abbr"].lower()] = canon_name
+        # Última palabra del nombre (ej. "celtics", "lakers", "nuggets", "pelicans", "warriors")
+        parts = canon_name.lower().split()
+        if parts:
+            token_map[parts[-1]] = canon_name
+        if len(parts) >= 2:
+            token_map[" ".join(parts[-2:])] = canon_name
+
+    lines = [ln.strip() for ln in str(texto).splitlines() if ln.strip()]
+    unmatched_lines_nums: List[List[float]] = []
+
+    for ln in lines:
+        ln_clean = ln.replace(",", ".")
+        # Buscar menciones a equipos en la línea
+        found_teams: List[Tuple[int, str]] = []
+        ln_lower = ln_clean.lower()
+        for alias, canon in sorted(token_map.items(), key=lambda x: len(x[0]), reverse=True):
+            for m in re.finditer(r"\b" + re.escape(alias) + r"\b", ln_lower):
+                pos = m.start()
+                if not any( abs(pos - p_ex) < 3 or c_ex == canon for p_ex, c_ex in found_teams ):
+                    found_teams.append((pos, canon))
+        found_teams.sort(key=lambda x: x[0])
+
+        # Extraer todos los números decimales en la línea
+        nums = [float(x) for x in re.findall(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?", ln_clean)]
+        odds_candidates = [x for x in nums if 1.02 <= x <= 25.0]
+        totals_candidates = [x for x in nums if 185.0 <= x <= 275.0]
+
+        if found_teams:
+            # Si encontramos al menos un equipo de la cartelera
+            matched_gkey = None
+            for _, t_canon in found_teams:
+                if t_canon in team_to_game_key:
+                    matched_gkey = team_to_game_key[t_canon][0]
+                    break
+            if matched_gkey is None and len(found_teams) >= 2:
+                # Si no estaba en cartelera pero hay 2 equipos en la línea
+                t1, t2 = found_teams[0][1], found_teams[1][1]
+                matched_gkey = f"{t1}_{t2}"
+
+            if matched_gkey:
+                entry = out.setdefault(matched_gkey, {})
+                loc_name, vis_name = matched_gkey.split("_", 1)
+                if len(found_teams) >= 2 and len(odds_candidates) >= 2:
+                    first_team = found_teams[0][1]
+                    if first_team == loc_name:
+                        entry["cuota_local"] = round(odds_candidates[0], 2)
+                        entry["cuota_visita"] = round(odds_candidates[1], 2)
+                    else:
+                        entry["cuota_visita"] = round(odds_candidates[0], 2)
+                        entry["cuota_local"] = round(odds_candidates[1], 2)
+                    if len(odds_candidates) >= 4:
+                        entry["cuota_over"] = round(odds_candidates[2], 2)
+                        entry["cuota_under"] = round(odds_candidates[3], 2)
+                elif len(found_teams) == 1 and len(odds_candidates) >= 1:
+                    only_team = found_teams[0][1]
+                    if only_team == loc_name:
+                        entry["cuota_local"] = round(odds_candidates[0], 2)
+                        if len(odds_candidates) >= 2:
+                            entry["cuota_visita"] = round(odds_candidates[1], 2)
+                    elif only_team == vis_name:
+                        entry["cuota_visita"] = round(odds_candidates[0], 2)
+                        if len(odds_candidates) >= 2:
+                            entry["cuota_local"] = round(odds_candidates[1], 2)
+
+                if totals_candidates:
+                    entry["linea_total"] = round(totals_candidates[0], 1)
+        elif len(odds_candidates) >= 2:
+            unmatched_lines_nums.append(nums)
+
+    # Si el usuario pegó únicamente filas de números en el mismo orden de la cartelera (ej. "1.45 2.80")
+    if unmatched_lines_nums and cartelera_list:
+        for idx, nums_row in enumerate(unmatched_lines_nums):
+            if idx >= len(cartelera_list):
+                break
+            g = cartelera_list[idx]
+            loc = normalizar_equipo(g.get("local"))
+            vis = normalizar_equipo(g.get("visita"))
+            if not loc or not vis:
+                continue
+            gkey = f"{loc}_{vis}"
+            odds_r = [x for x in nums_row if 1.02 <= x <= 25.0]
+            tots_r = [x for x in nums_row if 185.0 <= x <= 275.0]
+            if len(odds_r) >= 2:
+                entry = out.setdefault(gkey, {})
+                entry.setdefault("cuota_local", round(odds_r[0], 2))
+                entry.setdefault("cuota_visita", round(odds_r[1], 2))
+                if len(odds_r) >= 4:
+                    entry.setdefault("cuota_over", round(odds_r[2], 2))
+                    entry.setdefault("cuota_under", round(odds_r[3], 2))
+                if tots_r:
+                    entry.setdefault("linea_total", round(tots_r[0], 1))
+
+    return out

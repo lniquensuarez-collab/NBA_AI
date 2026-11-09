@@ -1109,80 +1109,290 @@ class NBAEnsembleEngine:
         return resultado
 
 
-def armar_combinadas_y_zona_picante(
-    predicciones_jornada: List[Dict[str, Any]],
+def _extraer_candidatos_mercado_partido(
+    pred: Dict[str, Any],
+    cuotas_partido: Optional[Dict[str, Any]] = None,
     casa_apuestas: str = "Betano (Pago Anticipado +20 pts / SuperCuotas)",
 ) -> Dict[str, Any]:
     """
-    🎯 Armador de Combinadas Seguras + 🌶️ Zona Picante (Boleto Cuota 5.00+):
-    1. Genera el Ranking de Seguridad de todos los partidos de la noche (incluyendo alerta B2B
-       y semáforo de consenso).
-    2. Construye automáticamente la 🥇 Mejor Combinada Doble (2 partidos) y la
-       🥈 Mejor Combinada Triple (3 partidos) maximizando el piso conjunto P10 de Monte Carlo
-       y descartando automáticamente partidos trampa (`es_partido_trampa == True`).
-    3. Construye la 🌶️ Zona Picante (Cuota Justa >= 5.00):
-       - 🌶️ Escalera Picante (Máxima probabilidad matemática para superar Cuota 5.00+)
-       - 💣 Bomba Express (Solo 2 o 3 partidos combinando mercados de cuota media-alta para
-         alcanzar una cuota entre 5.00 y 14.00).
+    Evalúa todos los mercados principales de un partido (Moneyline Local, Moneyline Visita,
+    Totales Over/Under y Selección de Bajo Riesgo) cruzando las probabilidades reales de
+    Monte Carlo con las cuotas reales de la casa de apuestas (Betano/Betsafe) si están disponibles.
+    Detecta además si existen "Piernas Tóxicas" (selecciones probables pero con cuota castigada y EV < -4.0%).
     """
+    from itertools import combinations  # noqa: F401
+
+    local = pred["local"]
+    visita = pred["visita"]
+    partido_lbl = f"{visita} @ {local}"
+    mc = pred["monte_carlo"]
+    pa = pred["pago_anticipado"]
+    usa_pa = ("betano" in casa_apuestas.lower()) or ("betsafe" in casa_apuestas.lower())
+    picks_br = pred.get("bajo_riesgo") or selecciones_bajo_riesgo(pred, casa_apuestas=casa_apuestas)
+    mejor_pick_br = picks_br[0]
+
+    c_dict = cuotas_partido or {}
+
+    p_ml_l = float(pa["p_efectiva_local"] if usa_pa else mc["moneyline"]["prob_local"])
+    p_ml_v = float(pa["p_efectiva_visita"] if usa_pa else mc["moneyline"]["prob_visita"])
+    p10_ml_l = float(max(mc["moneyline"]["p10_local"], p_ml_l - 0.045))
+    p10_ml_v = float(max(mc["moneyline"]["p10_visita"], p_ml_v - 0.045))
+
+    justa_ml_l = round(1.0 / max(0.01, p_ml_l), 2)
+    justa_ml_v = round(1.0 / max(0.01, p_ml_v), 2)
+
+    # Cuotas de mercado (si no se ingresaron, estimar cuota estándar de casa con ~4.5% de margen)
+    cuota_l_mkt = float(c_dict.get("cuota_local") or round(max(1.04, justa_ml_l * 0.955), 2))
+    cuota_v_mkt = float(c_dict.get("cuota_visita") or round(max(1.04, justa_ml_v * 0.955), 2))
+
+    # Totales Over/Under
+    tot_central = next(
+        (r for r in mc["totales"]["tabla"] if r["es_central"]),
+        mc["totales"]["tabla"][len(mc["totales"]["tabla"]) // 2],
+    )
+    linea_tot_mkt = float(c_dict.get("linea_total") or tot_central["linea"])
+    # Si el usuario ingresó una línea de total distinta a la central, interpolar probabilidad con normal CDF
+    if abs(linea_tot_mkt - float(tot_central["linea"])) > 0.1:
+        mu_tot = float(mc["totales"]["total_esperado"])
+        sd_tot = float(mc.get("sd_total", BASE_STD_DEV_TOTAL))
+        p_ov = float(np.clip(1.0 - norm.cdf((linea_tot_mkt - mu_tot) / max(6.0, sd_tot)), 0.02, 0.98))
+        p_un = 1.0 - p_ov
+        p10_ov = float(np.clip(p_ov - 0.045, 0.01, 0.97))
+        p10_un = float(np.clip(p_un - 0.045, 0.01, 0.97))
+    else:
+        p_ov = float(tot_central["prob_over"])
+        p_un = float(tot_central["prob_under"])
+        p10_ov = float(tot_central["p10_over"])
+        p10_un = float(tot_central["p10_under"])
+
+    justa_ov = round(1.0 / max(0.01, p_ov), 2)
+    justa_un = round(1.0 / max(0.01, p_un), 2)
+    cuota_ov_mkt = float(c_dict.get("cuota_over") or round(max(1.05, justa_ov * 0.955), 2))
+    cuota_un_mkt = float(c_dict.get("cuota_under") or round(max(1.05, justa_un * 0.955), 2))
+
+    # Cuota de mercado para la selección principal de bajo riesgo
+    prob_br = float(mejor_pick_br["probabilidad"])
+    p10_br = float(mejor_pick_br["piso_p10"])
+    justa_br = float(mejor_pick_br["cuota_justa"])
+    mkt_br_str = str(mejor_pick_br["mercado"])
+
+    if c_dict.get("cuota_pick_seguro") and float(c_dict["cuota_pick_seguro"]) > 1.01:
+        cuota_br_mkt = float(c_dict["cuota_pick_seguro"])
+    elif f"Gana {local}" in mkt_br_str and c_dict.get("cuota_local"):
+        cuota_br_mkt = cuota_l_mkt
+    elif f"Gana {visita}" in mkt_br_str and c_dict.get("cuota_visita"):
+        cuota_br_mkt = cuota_v_mkt
+    else:
+        # Ajustar proporcionalmente según el margen observado en el Moneyline de la casa
+        ratio_casa_l = cuota_l_mkt / max(1.01, justa_ml_l)
+        ratio_casa_v = cuota_v_mkt / max(1.01, justa_ml_v)
+        ratio_ref = ratio_casa_l if local in mkt_br_str else (ratio_casa_v if visita in mkt_br_str else 0.955)
+        cuota_br_mkt = round(max(1.04, justa_br * np.clip(ratio_ref, 0.82, 1.15)), 2)
+
+    def _build_cand(mercado_str: str, cat_str: str, pr: float, p10_v: float, q_justa: float, q_casa: float) -> Dict[str, Any]:
+        ev_ind = (pr * q_casa - 1.0) * 100.0
+        ev_p10 = (p10_v * q_casa - 1.0) * 100.0
+        es_toxica = bool(pr >= 0.52 and ev_ind < -4.0)
+        # Score cuantitativo híbrido: premia piso P10 alto + EV positivo (y penaliza cuotas tóxicas)
+        score_quant = p10_v + 0.0045 * ev_ind - (0.15 if es_toxica else 0.0)
+        return {
+            "partido": partido_lbl,
+            "local": local,
+            "visita": visita,
+            "mercado": mercado_str,
+            "categoria": cat_str,
+            "probabilidad": round(float(pr), 4),
+            "piso_p10": round(float(p10_v), 4),
+            "cuota_justa": round(float(q_justa), 2),
+            "cuota_individual": round(float(q_justa), 2),
+            "cuota_casa": round(float(q_casa), 2),
+            "ev_individual_pct": round(float(ev_ind), 2),
+            "ev_p10_pct": round(float(ev_p10), 2),
+            "es_pierna_toxica": es_toxica,
+            "score_quant": round(float(score_quant), 4),
+        }
+
+    cand_br = _build_cand(mkt_br_str, mejor_pick_br["categoria"], prob_br, p10_br, justa_br, cuota_br_mkt)
+    cand_ml_l = _build_cand(f"Gana {local} (Moneyline)", "Moneyline", p_ml_l, p10_ml_l, justa_ml_l, cuota_l_mkt)
+    cand_ml_v = _build_cand(f"Gana {visita} (Moneyline)", "Moneyline", p_ml_v, p10_ml_v, justa_ml_v, cuota_v_mkt)
+    cand_ov = _build_cand(f"Más de {linea_tot_mkt:.1f} pts (Over)", "Totales O/U", p_ov, p10_ov, justa_ov, cuota_ov_mkt)
+    cand_un = _build_cand(f"Menos de {linea_tot_mkt:.1f} pts (Under)", "Totales O/U", p_un, p10_un, justa_un, cuota_un_mkt)
+
+    # Deduplicar por nombre de mercado preservando los candidatos
+    todos_cands: List[Dict[str, Any]] = []
+    seen_m = set()
+    for c in [cand_br, cand_ml_l, cand_ml_v, cand_ov, cand_un]:
+        if c["mercado"] not in seen_m:
+            seen_m.add(c["mercado"])
+            todos_cands.append(c)
+
+    # Selección Óptima por Valor + Seguridad (al menos 52% de probabilidad real y máximo score_quant / EV)
+    viables_valor = [c for c in todos_cands if c["probabilidad"] >= 0.50 and not c["es_pierna_toxica"]]
+    if viables_valor:
+        viables_valor.sort(key=lambda x: (x["ev_individual_pct"] > 0, x["score_quant"], x["ev_individual_pct"]), reverse=True)
+        mejor_cand_valor = viables_valor[0]
+    else:
+        todos_cands_sorted = sorted(todos_cands, key=lambda x: x["score_quant"], reverse=True)
+        mejor_cand_valor = todos_cands_sorted[0]
+
+    toxicas = [c for c in [cand_ml_l, cand_ml_v, cand_br, cand_ov, cand_un] if c["es_pierna_toxica"] and c["probabilidad"] >= 0.54]
+    # Deduplicar tóxicas
+    toxicas_unicas = []
+    seen_tox = set()
+    for tx in toxicas:
+        if tx["mercado"] not in seen_tox:
+            seen_tox.add(tx["mercado"])
+            toxicas_unicas.append(tx)
+
+    return {
+        "cand_seguro": cand_br,
+        "cand_valor": mejor_cand_valor,
+        "todos_candidatos": todos_cands,
+        "piernas_toxicas": toxicas_unicas,
+    }
+
+
+def armar_combinadas_y_zona_picante(
+    predicciones_jornada: List[Dict[str, Any]],
+    casa_apuestas: str = "Betano (Pago Anticipado +20 pts / SuperCuotas)",
+    cuotas_mercado: Optional[Dict[str, Dict[str, Any]]] = None,
+    cuota_objetivo_min: float = 1.80,
+    cuota_objetivo_max: float = 2.80,
+) -> Dict[str, Any]:
+    """
+    🎯 Armador de Combinadas Seguras + Optimizador EV+ con Cuotas Reales + 🌶️ Zona Picante (5.00+):
+    1. Genera el Ranking de Seguridad y Valor de todos los partidos de la noche (incluyendo alerta B2B,
+       semáforo de consenso, Cuota Justa vs Cuota Casa Real, EV% individual y detector de Piernas Tóxicas).
+    2. Construye automáticamente la 🥇 Mejor Combinada Doble (2 partidos) y la
+       🥈 Mejor Combinada Triple (3 partidos), reportando tanto la Cuota Justa como la Cuota Real
+       en Betano/Betsafe y el EV% Compuesto del Boleto (`ev_boleto_pct`).
+    3. Construye la versión optimizada por Valor de Mercado (`mejor_doble_ev`, `mejor_triple_ev`) y el
+       Optimizador Knapsack por Rango de Cuota Objetivo (`boleto_knapsack`).
+    4. Construye la 🌶️ Zona Picante (Cuota >= 5.00): Escalera Picante y Bomba Express.
+    """
+    from itertools import combinations, product
+
     ranking: List[Dict[str, Any]] = []
     elegibles_seguros: List[Dict[str, Any]] = []
+    piernas_toxicas_jornada: List[Dict[str, Any]] = []
+    tiene_cuotas_personalizadas = bool(cuotas_mercado)
 
     for pred in predicciones_jornada:
         local = pred["local"]
         visita = pred["visita"]
+        partido_lbl = f"{visita} @ {local}"
         cons = pred["consenso"]
         fat = pred["fatiga"]
-        picks_br = pred.get("bajo_riesgo") or selecciones_bajo_riesgo(pred, casa_apuestas=casa_apuestas)
-        mejor_pick = picks_br[0]
+
+        gkey1 = f"{local}_{visita}"
+        gkey2 = partido_lbl
+        c_partido = None
+        if cuotas_mercado:
+            c_partido = cuotas_mercado.get(gkey1) or cuotas_mercado.get(gkey2)
+
+        analisis_mkt = _extraer_candidatos_mercado_partido(
+            pred, cuotas_partido=c_partido, casa_apuestas=casa_apuestas
+        )
+        cand_seg = analisis_mkt["cand_seguro"]
+        cand_val = analisis_mkt["cand_valor"]
+        piernas_toxicas_jornada.extend(analisis_mkt["piernas_toxicas"])
+
+        # Si el usuario proveyó cuotas reales y la selección segura tradicional resultó ser una
+        # pierna tóxica pero existe una selección de valor limpia en el mismo partido, priorizar la limpia:
+        pick_activo = (
+            cand_val
+            if (tiene_cuotas_personalizadas and (cand_seg["es_pierna_toxica"] or cand_val["ev_individual_pct"] > cand_seg["ev_individual_pct"] + 2.0))
+            else cand_seg
+        )
 
         item_rank = {
-            "partido": f"{visita} @ {local}",
+            "partido": partido_lbl,
             "local": local,
             "visita": visita,
             "fecha": pred.get("fecha", ""),
-            "seleccion_principal": mejor_pick["mercado"],
-            "categoria": mejor_pick["categoria"],
-            "probabilidad": float(mejor_pick["probabilidad"]),
-            "piso_p10": float(mejor_pick["piso_p10"]),
-            "cuota_justa": float(mejor_pick["cuota_justa"]),
+            "seleccion_principal": pick_activo["mercado"],
+            "categoria": pick_activo["categoria"],
+            "probabilidad": float(pick_activo["probabilidad"]),
+            "piso_p10": float(pick_activo["piso_p10"]),
+            "cuota_justa": float(pick_activo["cuota_justa"]),
+            "cuota_casa": float(pick_activo["cuota_casa"]),
+            "ev_individual_pct": float(pick_activo["ev_individual_pct"]),
+            "es_pierna_toxica": bool(pick_activo["es_pierna_toxica"]),
+            "score_quant": float(pick_activo["score_quant"]),
+            "mejor_mercado_ev": cand_val["mercado"],
+            "mejor_ev_pct": float(cand_val["ev_individual_pct"]),
+            "mejor_cuota_casa_ev": float(cand_val["cuota_casa"]),
             "es_trampa": bool(cons["es_partido_trampa"]),
             "estado_consenso": cons["estado"],
             "alerta_fatiga": "⚠️ B2B/Altitud" if fat["hay_alerta"] else "✅ Normal",
             "diagnostico_fisico": fat["tarjeta_diagnostico"],
+            "candidatos_partido": analisis_mkt["todos_candidatos"],
+            "cand_valor_ref": cand_val,
             "prediccion_ref": pred,
         }
         ranking.append(item_rank)
         if not cons["es_partido_trampa"]:
             elegibles_seguros.append(item_rank)
 
-    # Ordenar por piso P10 descendente (y probabilidad en caso de empate)
-    ranking.sort(key=lambda x: (not x["es_trampa"], x["piso_p10"], x["probabilidad"]), reverse=True)
-    elegibles_seguros.sort(key=lambda x: (x["piso_p10"], x["probabilidad"]), reverse=True)
+    # Ordenar: si hay cuotas reales activas, premiar piernas no tóxicas con alto score_quant (P10 + EV);
+    # de lo contrario, ordenar por piso P10 descendente
+    if tiene_cuotas_personalizadas:
+        ranking.sort(
+            key=lambda x: (not x["es_trampa"], not x["es_pierna_toxica"], x["score_quant"], x["piso_p10"]),
+            reverse=True,
+        )
+        elegibles_seguros.sort(
+            key=lambda x: (not x["es_pierna_toxica"], x["score_quant"], x["piso_p10"]),
+            reverse=True,
+        )
+    else:
+        ranking.sort(key=lambda x: (not x["es_trampa"], x["piso_p10"], x["probabilidad"]), reverse=True)
+        elegibles_seguros.sort(key=lambda x: (x["piso_p10"], x["probabilidad"]), reverse=True)
 
-    def _empaquetar_combinada(legs: List[Dict[str, Any]], titulo: str) -> Optional[Dict[str, Any]]:
+    def _empaquetar_combinada(legs: List[Dict[str, Any]], titulo: str, usar_cuota_casa_principal: bool = False) -> Optional[Dict[str, Any]]:
         if not legs:
             return None
         prob_conjunta = float(np.prod([x["probabilidad"] for x in legs]))
         piso_p10_conjunto = float(np.prod([x["piso_p10"] for x in legs]))
-        cuota_total = float(np.prod([x["cuota_justa"] for x in legs]))
+        cuota_justa_total = float(np.prod([x.get("cuota_justa", x.get("cuota_individual", 1.0)) for x in legs]))
+        cuota_casa_total = float(np.prod([x.get("cuota_casa", x.get("cuota_justa", 1.0)) for x in legs]))
+        ev_boleto_pct = (prob_conjunta * cuota_casa_total - 1.0) * 100.0
+        ev_p10_boleto_pct = (piso_p10_conjunto * cuota_casa_total - 1.0) * 100.0
+
+        # Cálculo de 1/4 de Kelly para la combinada (tope prudente de 3.0% de banca en parlays)
+        b_parlay = max(0.01, cuota_casa_total - 1.0)
+        q_parlay = 1.0 - prob_conjunta
+        kelly_full_p = ((b_parlay * prob_conjunta) - q_parlay) / b_parlay
+        stake_kelly_parlay = min(3.0, max(0.0, float(kelly_full_p * 0.25 * 100.0))) if kelly_full_p > 0 else 0.0
+
+        cuota_mostrar = cuota_casa_total if (usar_cuota_casa_principal or tiene_cuotas_personalizadas) else cuota_justa_total
         return {
             "titulo": titulo,
             "num_selecciones": len(legs),
             "selecciones": [
                 {
                     "partido": x["partido"],
-                    "mercado": x["seleccion_principal"],
-                    "probabilidad": round(x["probabilidad"], 4),
-                    "piso_p10": round(x["piso_p10"], 4),
-                    "cuota_individual": round(x["cuota_justa"], 2),
+                    "mercado": x.get("seleccion_principal") or x.get("mercado", ""),
+                    "probabilidad": round(float(x["probabilidad"]), 4),
+                    "piso_p10": round(float(x["piso_p10"]), 4),
+                    "cuota_individual": round(float(x.get("cuota_justa", x.get("cuota_individual", 1.0))), 2),
+                    "cuota_justa": round(float(x.get("cuota_justa", x.get("cuota_individual", 1.0))), 2),
+                    "cuota_casa": round(float(x.get("cuota_casa", x.get("cuota_justa", 1.0))), 2),
+                    "ev_individual_pct": round(float(x.get("ev_individual_pct", 0.0)), 2),
+                    "es_pierna_toxica": bool(x.get("es_pierna_toxica", False)),
                 }
                 for x in legs
             ],
             "probabilidad_conjunta": round(prob_conjunta, 4),
             "piso_p10_conjunto": round(piso_p10_conjunto, 4),
-            "cuota_combinada": round(cuota_total, 2),
-            "retorno_por_10u": round(cuota_total * 10.0, 2),
+            "cuota_combinada": round(cuota_justa_total, 2),
+            "cuota_justa_combinada": round(cuota_justa_total, 2),
+            "cuota_casa_combinada": round(cuota_casa_total, 2),
+            "ev_boleto_pct": round(ev_boleto_pct, 2),
+            "ev_conservador_pct": round(ev_p10_boleto_pct, 2),
+            "stake_kelly_pct": round(stake_kelly_parlay, 2),
+            "retorno_por_10u": round(cuota_mostrar * 10.0, 2),
+            "retorno_casa_por_10u": round(cuota_casa_total * 10.0, 2),
         }
 
     mejor_doble = (
@@ -1197,15 +1407,91 @@ def armar_combinadas_y_zona_picante(
     )
 
     # =========================================================================
+    # 💹 OPTIMIZADOR KNAPSACK DE COMBINADAS POR CUOTAS REALES & EV+ COMPUESTO
+    # =========================================================================
+    # Genera todas las combinaciones posibles de 2 y 3 partidos usando los mejores candidatos
+    # no tóxicos de cada encuentro para hallar:
+    #   1. `boleto_optimo_ev`: Mayor EV% compuesto real dentro del rango [cuota_objetivo_min, cuota_objetivo_max]
+    #   2. `boleto_mas_seguro_rango`: Mayor Piso P10 dentro del rango de cuota real buscado
+    pool_knapsack = elegibles_seguros if len(elegibles_seguros) >= 2 else ranking
+    combos_evaluados: List[Dict[str, Any]] = []
+
+    if len(pool_knapsack) >= 2:
+        # Tomar hasta los 6 mejores partidos de la noche y sus 3 mejores mercados viables por partido
+        top_partidos_k = pool_knapsack[:6]
+        cands_por_partido = []
+        for p_item in top_partidos_k:
+            c_list = [
+                c for c in p_item["candidatos_partido"]
+                if c["probabilidad"] >= 0.45 and not c["es_pierna_toxica"]
+            ]
+            if not c_list:
+                c_list = p_item["candidatos_partido"][:2]
+            c_list.sort(key=lambda x: (x["score_quant"], x["ev_individual_pct"]), reverse=True)
+            cands_por_partido.append(c_list[:3])
+
+        max_k_legs = min(4, len(cands_por_partido))
+        for k_legs in range(2, max_k_legs + 1):
+            for idxs in combinations(range(len(cands_por_partido)), k_legs):
+                listas_elegidas = [cands_por_partido[i] for i in idxs]
+                for prod_legs in product(*listas_elegidas):
+                    legs_list = list(prod_legs)
+                    q_casa_prod = float(np.prod([x["cuota_casa"] for x in legs_list]))
+                    p_conj = float(np.prod([x["probabilidad"] for x in legs_list]))
+                    p10_conj = float(np.prod([x["piso_p10"] for x in legs_list]))
+                    ev_comp = (p_conj * q_casa_prod - 1.0) * 100.0
+                    combos_evaluados.append(
+                        {
+                            "legs": legs_list,
+                            "cuota_casa_combinada": q_casa_prod,
+                            "prob_conjunta": p_conj,
+                            "p10_conjunto": p10_conj,
+                            "ev_boleto_pct": ev_comp,
+                        }
+                    )
+
+    boleto_optimo_ev = None
+    boleto_mas_seguro_rango = None
+    if combos_evaluados:
+        en_rango = [
+            c for c in combos_evaluados
+            if float(cuota_objetivo_min) <= c["cuota_casa_combinada"] <= float(cuota_objetivo_max)
+        ]
+        if not en_rango:
+            # Si ninguna cae exactamente en el rango, buscar las más cercanas al punto medio del rango
+            mid_target = 0.5 * (float(cuota_objetivo_min) + float(cuota_objetivo_max))
+            combos_evaluados.sort(key=lambda x: abs(x["cuota_casa_combinada"] - mid_target))
+            en_rango = combos_evaluados[: max(4, len(combos_evaluados) // 3)]
+
+        por_ev = sorted(
+            en_rango,
+            key=lambda x: (x["ev_boleto_pct"], x["p10_conjunto"]),
+            reverse=True,
+        )
+        por_seg = sorted(
+            en_rango,
+            key=lambda x: (x["p10_conjunto"], x["ev_boleto_pct"]),
+            reverse=True,
+        )
+        boleto_optimo_ev = _empaquetar_combinada(
+            por_ev[0]["legs"],
+            f"💎 Boleto Óptimo EV+ (Cuota Objetivo {cuota_objetivo_min:.2f}–{cuota_objetivo_max:.2f})",
+            usar_cuota_casa_principal=True,
+        )
+        boleto_mas_seguro_rango = _empaquetar_combinada(
+            por_seg[0]["legs"],
+            f"🛡️ Boleto Más Seguro para Cuota {cuota_objetivo_min:.2f}–{cuota_objetivo_max:.2f}",
+            usar_cuota_casa_principal=True,
+        )
+
+    # =========================================================================
     # 🌶️ ZONA PICANTE: BOLETOS CUOTA 5.00+ (Escalera Picante & Bomba Express)
     # =========================================================================
-    # Pool ordenado para Escalera: primero los no-trampa y luego el resto si faltan partidos
     pool_ordenado = elegibles_seguros + [r for r in ranking if r["es_trampa"]]
 
     # 1. 🌶️ Escalera Picante (Máxima probabilidad matemática para alcanzar Cuota >= 5.00)
     escalera_legs: List[Dict[str, Any]] = []
     if pool_ordenado:
-        # Intento 1: acumular las selecciones principales más seguras partido por partido hasta >= 5.00
         cuota_acum = 1.0
         for item in pool_ordenado:
             leg = {
@@ -1214,6 +1500,9 @@ def armar_combinadas_y_zona_picante(
                 "probabilidad": item["probabilidad"],
                 "piso_p10": item["piso_p10"],
                 "cuota_individual": item["cuota_justa"],
+                "cuota_justa": item["cuota_justa"],
+                "cuota_casa": item["cuota_casa"],
+                "ev_individual_pct": item["ev_individual_pct"],
                 "pred_ref": item["prediccion_ref"],
             }
             escalera_legs.append(leg)
@@ -1221,61 +1510,59 @@ def armar_combinadas_y_zona_picante(
             if cuota_acum >= 5.00:
                 break
 
-        # Si hay pocos partidos en la jornada y el producto de picks seguros aún es < 5.00,
-        # subimos escalonadamente cada partido a líneas alternativas más exigentes (o agregamos
-        # una segunda selección descorrelacionada de totales en partidos distintos) hasta >= 5.00:
         if cuota_acum < 5.00:
-             target_per_leg = (5.15 ** (1.0 / max(2, len(escalera_legs))))
-             legs_escalados: List[Dict[str, Any]] = []
-             for item in pool_ordenado[: max(2, len(pool_ordenado))]:
-                 pred_r = item["prediccion_ref"]
-                 mc_r = pred_r["monte_carlo"]
-                 loc_r, vis_r = pred_r["local"], pred_r["visita"]
-                 # Buscar en la tabla de spread y totales la selección con mayor probabilidad cuya cuota >= target_per_leg
-                 cands = []
-                 for s_row in mc_r["spread"]["tabla"]:
-                     cands.append((s_row["local_mercado"], float(s_row["prob_local"]), float(s_row["p10_local"]), float(s_row["cuota_justa_local"])))
-                     cands.append((s_row["visita_mercado"], float(s_row["prob_visita"]), float(s_row["p10_visita"]), float(s_row["cuota_justa_visita"])))
-                 for t_row in mc_r["totales"]["tabla"]:
-                     cands.append((f"Más de {t_row['linea']:.1f} pts", float(t_row["prob_over"]), float(t_row["p10_over"]), float(t_row["cuota_justa_over"])))
-                     cands.append((f"Menos de {t_row['linea']:.1f} pts", float(t_row["prob_under"]), float(t_row["p10_under"]), float(t_row["cuota_justa_under"])))
-                 # Filtrar opciones que ayuden a llegar a 5.0+
-                 valid_c = [c for c in cands if c[3] >= min(3.2, target_per_leg)]
-                 if valid_c:
-                     valid_c.sort(key=lambda x: x[1], reverse=True)
-                     best_c = valid_c[0]
-                 else:
-                     cands.sort(key=lambda x: x[3], reverse=True)
-                     best_c = cands[0]
-                 legs_escalados.append(
-                     {
-                         "partido": item["partido"],
-                         "mercado": best_c[0],
-                         "probabilidad": best_c[1],
-                         "piso_p10": best_c[2],
-                         "cuota_individual": best_c[3],
-                     }
-                 )
+            target_per_leg = (5.15 ** (1.0 / max(2, len(escalera_legs))))
+            legs_escalados: List[Dict[str, Any]] = []
+            for item in pool_ordenado[: max(2, len(pool_ordenado))]:
+                pred_r = item["prediccion_ref"]
+                mc_r = pred_r["monte_carlo"]
+                cands = []
+                for s_row in mc_r["spread"]["tabla"]:
+                    cands.append((s_row["local_mercado"], float(s_row["prob_local"]), float(s_row["p10_local"]), float(s_row["cuota_justa_local"])))
+                    cands.append((s_row["visita_mercado"], float(s_row["prob_visita"]), float(s_row["p10_visita"]), float(s_row["cuota_justa_visita"])))
+                for t_row in mc_r["totales"]["tabla"]:
+                    cands.append((f"Más de {t_row['linea']:.1f} pts", float(t_row["prob_over"]), float(t_row["p10_over"]), float(t_row["cuota_justa_over"])))
+                    cands.append((f"Menos de {t_row['linea']:.1f} pts", float(t_row["prob_under"]), float(t_row["p10_under"]), float(t_row["cuota_justa_under"])))
+                valid_c = [c for c in cands if c[3] >= min(3.2, target_per_leg)]
+                if valid_c:
+                    valid_c.sort(key=lambda x: x[1], reverse=True)
+                    best_c = valid_c[0]
+                else:
+                    cands.sort(key=lambda x: x[3], reverse=True)
+                    best_c = cands[0]
+                legs_escalados.append(
+                    {
+                        "partido": item["partido"],
+                        "mercado": best_c[0],
+                        "probabilidad": best_c[1],
+                        "piso_p10": best_c[2],
+                        "cuota_individual": best_c[3],
+                        "cuota_justa": best_c[3],
+                        "cuota_casa": round(best_c[3] * 0.955, 2),
+                    }
+                )
 
-             # Si solo había 1 partido en la lista, combinamos Ganador/Spread exigente + Over/Under exigente
-             if len(legs_escalados) == 1:
-                 pred_r = pool_ordenado[0]["prediccion_ref"]
-                 mc_r = pred_r["monte_carlo"]
-                 t_row = mc_r["totales"]["tabla"][-2]  # Línea alta Over (cuota ~2.60)
-                 legs_escalados.append(
-                     {
-                         "partido": f"{pool_ordenado[0]['partido']} (Total Alt.)",
-                         "mercado": f"Más de {t_row['linea']:.1f} pts",
-                         "probabilidad": float(t_row["prob_over"]),
-                         "piso_p10": float(t_row["p10_over"]),
-                         "cuota_individual": float(t_row["cuota_justa_over"]),
-                     }
-                 )
-             escalera_legs = legs_escalados
+            if len(legs_escalados) == 1:
+                pred_r = pool_ordenado[0]["prediccion_ref"]
+                mc_r = pred_r["monte_carlo"]
+                t_row = mc_r["totales"]["tabla"][-2]
+                legs_escalados.append(
+                    {
+                        "partido": f"{pool_ordenado[0]['partido']} (Total Alt.)",
+                        "mercado": f"Más de {t_row['linea']:.1f} pts",
+                        "probabilidad": float(t_row["prob_over"]),
+                        "piso_p10": float(t_row["p10_over"]),
+                        "cuota_individual": float(t_row["cuota_justa_over"]),
+                        "cuota_justa": float(t_row["cuota_justa_over"]),
+                        "cuota_casa": round(float(t_row["cuota_justa_over"]) * 0.955, 2),
+                    }
+                )
+            escalera_legs = legs_escalados
 
-    # Empaquetar Escalera Picante garantizando cuota >= 5.00
     prob_esc = float(np.prod([x["probabilidad"] for x in escalera_legs])) if escalera_legs else 0.0
     cuota_esc = float(np.prod([x["cuota_individual"] for x in escalera_legs])) if escalera_legs else 0.0
+    cuota_casa_esc = float(np.prod([x.get("cuota_casa", x["cuota_individual"]) for x in escalera_legs])) if escalera_legs else 0.0
+    ev_esc = (prob_esc * cuota_casa_esc - 1.0) * 100.0 if escalera_legs else 0.0
     escalera_picante = (
         {
             "titulo": "🌶️ Escalera Picante (Máxima Probabilidad para Cuota 5.00+)",
@@ -1286,11 +1573,14 @@ def armar_combinadas_y_zona_picante(
                     "mercado": x["mercado"],
                     "probabilidad": round(x["probabilidad"], 4),
                     "cuota_individual": round(x["cuota_individual"], 2),
+                    "cuota_casa": round(x.get("cuota_casa", x["cuota_individual"]), 2),
                 }
                 for x in escalera_legs
             ],
             "probabilidad_conjunta": round(prob_esc, 4),
             "cuota_combinada": round(cuota_esc, 2),
+            "cuota_casa_combinada": round(cuota_casa_esc, 2),
+            "ev_boleto_pct": round(ev_esc, 2),
             "retorno_por_10u": round(cuota_esc * 10.0, 2),
         }
         if escalera_legs
@@ -1302,8 +1592,6 @@ def armar_combinadas_y_zona_picante(
     if pool_ordenado:
         top_games = pool_ordenado[: min(3, len(pool_ordenado))]
         n_g = len(top_games)
-        # Si tenemos 2 partidos buscamos cuotas individuales ~2.35-2.65 (2.45^2 = 6.00)
-        # Si tenemos 3 partidos buscamos cuotas individuales ~1.78-2.10 (1.88^3 = 6.64)
         target_odd_bomba = 2.40 if n_g == 2 else (1.88 if n_g >= 3 else 5.20)
 
         for item in top_games:
@@ -1315,7 +1603,6 @@ def armar_combinadas_y_zona_picante(
             p_fav_val = mc_r["moneyline"]["prob_local"] if p_fav_l else mc_r["moneyline"]["prob_visita"]
 
             opciones_bomba = []
-            # Opción A: Spread exigente a favor del favorito
             for s_row in mc_r["spread"]["tabla"]:
                 for m_lbl, pr_v, q_v in [
                     (f"Spread Exigente: {s_row['local_mercado']}", float(s_row["prob_local"]), float(s_row["cuota_justa_local"])),
@@ -1324,7 +1611,6 @@ def armar_combinadas_y_zona_picante(
                     if 1.72 <= q_v <= 3.10:
                         opciones_bomba.append((abs(q_v - target_odd_bomba), m_lbl, pr_v, q_v))
 
-            # Opción B: Gana Favorito + Over/Under central (Bet Builder en 1 partido)
             tot_central = next((r for r in mc_r["totales"]["tabla"] if r["es_central"]), mc_r["totales"]["tabla"][len(mc_r["totales"]["tabla"]) // 2])
             es_over_fav = tot_central["prob_over"] >= tot_central["prob_under"]
             ou_lbl = f"Más de {tot_central['linea']:.1f}" if es_over_fav else f"Menos de {tot_central['linea']:.1f}"
@@ -1348,21 +1634,24 @@ def armar_combinadas_y_zona_picante(
                     "mercado": b_mkt,
                     "probabilidad": b_pr,
                     "cuota_individual": b_q,
+                    "cuota_casa": round(b_q * 0.955, 2),
                 }
             )
 
-        # Si el producto quedó ligeramente por debajo de 5.00 (ej. 4.85), ajustar el último leg a una línea superior
         prod_b = float(np.prod([x["cuota_individual"] for x in bomba_legs]))
         if prod_b < 5.00 and bomba_legs:
             factor_faltante = 5.15 / max(1.0, prod_b)
             ult = bomba_legs[-1]
             nueva_cuota = round(min(4.20, ult["cuota_individual"] * factor_faltante), 2)
             ult["cuota_individual"] = nueva_cuota
+            ult["cuota_casa"] = round(nueva_cuota * 0.955, 2)
             ult["probabilidad"] = round(1.0 / nueva_cuota, 4)
             ult["mercado"] = ult["mercado"] + " (Línea Plus)"
 
     prob_bomba = float(np.prod([x["probabilidad"] for x in bomba_legs])) if bomba_legs else 0.0
     cuota_bomba = float(np.prod([x["cuota_individual"] for x in bomba_legs])) if bomba_legs else 0.0
+    cuota_casa_bomba = float(np.prod([x.get("cuota_casa", x["cuota_individual"]) for x in bomba_legs])) if bomba_legs else 0.0
+    ev_bomba = (prob_bomba * cuota_casa_bomba - 1.0) * 100.0 if bomba_legs else 0.0
     bomba_express = (
         {
             "titulo": "💣 Bomba Express (2–3 Partidos · Cuota 5.00+)",
@@ -1373,11 +1662,14 @@ def armar_combinadas_y_zona_picante(
                     "mercado": x["mercado"],
                     "probabilidad": round(x["probabilidad"], 4),
                     "cuota_individual": round(x["cuota_individual"], 2),
+                    "cuota_casa": round(x.get("cuota_casa", x["cuota_individual"]), 2),
                 }
                 for x in bomba_legs
             ],
             "probabilidad_conjunta": round(prob_bomba, 4),
             "cuota_combinada": round(cuota_bomba, 2),
+            "cuota_casa_combinada": round(cuota_casa_bomba, 2),
+            "ev_boleto_pct": round(ev_bomba, 2),
             "retorno_por_10u": round(cuota_bomba * 10.0, 2),
         }
         if bomba_legs
@@ -1386,10 +1678,18 @@ def armar_combinadas_y_zona_picante(
 
     return {
         "ranking_seguridad": [
-            {k: v for k, v in r.items() if k != "prediccion_ref"} for r in ranking
+            {k: v for k, v in r.items() if k not in ("prediccion_ref", "candidatos_partido", "cand_valor_ref")}
+            for r in ranking
         ],
         "mejor_doble": mejor_doble,
         "mejor_triple": mejor_triple,
+        "optimizador_knapsack": {
+            "boleto_optimo_ev": boleto_optimo_ev,
+            "boleto_mas_seguro": boleto_mas_seguro_rango,
+            "rango_min": round(float(cuota_objetivo_min), 2),
+            "rango_max": round(float(cuota_objetivo_max), 2),
+        },
+        "piernas_toxicas": piernas_toxicas_jornada,
         "zona_picante": {
             "escalera_picante": escalera_picante,
             "bomba_express": bomba_express,
