@@ -5,10 +5,36 @@ en mercados de apuestas de la NBA (Optimizada para Betano y Betsafe).
 """
 
 from datetime import datetime, date, timedelta
+import importlib
 from typing import Dict, Any, List, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+import engine.config
+import engine.db
+import engine.data_bot
+import engine.elo_system
+import engine.features
+import engine.models
+import engine.backtest
+import engine.players
+
+# Garantizar recarga en caliente (Hot-Reload) en Streamlit Cloud cuando se actualizan submódulos de `engine.*`
+if not hasattr(engine.data_bot, "parsear_cuotas_rapidas_texto") or not hasattr(
+    engine.models, "_extraer_candidatos_mercado_partido"
+):
+    for _mod in (
+        engine.config,
+        engine.db,
+        engine.data_bot,
+        engine.elo_system,
+        engine.features,
+        engine.models,
+        engine.backtest,
+        engine.players,
+    ):
+        importlib.reload(_mod)
 
 from engine.config import (
     NBA_TEAMS,
@@ -85,7 +111,7 @@ def _entrenar_motor_base(
 
 @st.cache_resource(show_spinner=False)
 def _cargar_motor_cached(
-    half_life: float, db_path: Optional[str] = None
+    half_life: float, db_path: Optional[str] = None, _engine_version: str = "v2.2"
 ) -> tuple[NBAEnsembleEngine, pd.DataFrame, pd.DataFrame]:
     return _entrenar_motor_base(half_life=half_life, db_path=db_path)
 
@@ -94,7 +120,9 @@ def cargar_motor_entrenado(
     half_life: float, n_sims: int, db_path: Optional[str] = None
 ) -> tuple[NBAEnsembleEngine, pd.DataFrame, pd.DataFrame]:
     if hasattr(st, "cache_resource") and db_path is None:
-        engine, df, df_feat = _cargar_motor_cached(half_life=half_life, db_path=db_path)
+        engine, df, df_feat = _cargar_motor_cached(
+            half_life=half_life, db_path=db_path, _engine_version="v2.2"
+        )
     else:
         engine, df, df_feat = _entrenar_motor_base(half_life=half_life, db_path=db_path)
     engine.n_sims = int(n_sims)
