@@ -101,6 +101,41 @@ def init_db(db_path: Optional[str] = None) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_partidos_fecha ON partidos(fecha)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_partidos_temporada ON partidos(temporada)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_partidos_equipos ON partidos(local, visita)")
+
+        # Tabla SQLite de Estadísticas Reales y Estado de Lesiones de Jugadores NBA (ESPN Live)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jugadores_stats (
+                id TEXT PRIMARY KEY,
+                jugador TEXT,
+                equipo TEXT,
+                pos TEXT,
+                pj INTEGER DEFAULT 0,
+                min REAL,
+                pts REAL,
+                reb REAL,
+                ast REAL,
+                tpm REAL,
+                pra REAL,
+                pts_l5 REAL,
+                reb_l5 REAL,
+                ast_l5 REAL,
+                tpm_l5 REAL,
+                pra_l5 REAL,
+                sd_pts REAL,
+                sd_reb REAL,
+                sd_ast REAL,
+                usg REAL,
+                impacto_pts REAL,
+                estado_lesion TEXT DEFAULT 'Activa',
+                detalle_lesion TEXT DEFAULT '',
+                fuente TEXT DEFAULT 'ESPN Live',
+                actualizado_en TEXT,
+                UNIQUE(jugador, equipo)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_jugadores_equipo ON jugadores_stats(equipo)")
         conn.commit()
     finally:
         conn.close()

@@ -65,7 +65,9 @@ from engine.models import (
 from engine.backtest import ejecutar_backtest_walk_forward
 from engine.players import (
     obtener_jugadores_equipo,
+    obtener_bajas_detectadas_equipo,
     obtener_catalogo_completo_jugadores,
+    guardar_jugadores_db,
     calcular_impacto_bajas,
     proyectar_y_simular_jugador,
     proyectar_plantilla_partido,
@@ -257,11 +259,13 @@ class TestNBAUltimateEngine(unittest.TestCase):
         print("✅ [7/8] Backtest Walk-Forward cronológico y Simulación Financiera verificados.")
 
     def test_08_estadisticas_jugadores_props_y_bajas(self) -> None:
-        df_cat = obtener_catalogo_completo_jugadores()
+        df_cat = obtener_catalogo_completo_jugadores(db_path=self.db_path)
         self.assertGreaterEqual(len(df_cat), 90)
         self.assertIn("PRA (PTS+REB+AST)", df_cat.columns)
+        self.assertIn("PTS (L5)", df_cat.columns)
+        self.assertIn("Estado", df_cat.columns)
 
-        bos_players = obtener_jugadores_equipo("Boston Celtics")
+        bos_players = obtener_jugadores_equipo("Boston Celtics", db_path=self.db_path)
         self.assertGreaterEqual(len(bos_players), 4)
         tatum = bos_players[0]
         sim_tatum = proyectar_y_simular_jugador(tatum, es_local=True, pace_esperado=100.5, drtg_rival=115.2, n_sims=3000)
@@ -273,15 +277,21 @@ class TestNBAUltimateEngine(unittest.TestCase):
                 places=3,
             )
 
+        # Verificar persistencia SQLite de estado de lesión y racha L5
+        tatum_lesionado = dict(tatum, estado_lesion="Baja (Out)", pts_l5=32.4)
+        guardar_jugadores_db([tatum_lesionado], db_path=self.db_path)
+        bajas_auto = obtener_bajas_detectadas_equipo("Boston Celtics", db_path=self.db_path)
+        self.assertIn(tatum["jugador"], bajas_auto)
+
         bajas_info = calcular_impacto_bajas(
-            "Boston Celtics", "Los Angeles Lakers", bajas_local=["Jayson Tatum"], bajas_visita=[]
+            "Boston Celtics", "Los Angeles Lakers", bajas_local=["Jayson Tatum"], bajas_visita=[], db_path=self.db_path
         )
         self.assertLess(bajas_info["ajuste_spread_local_pts"], 0.0)
         self.assertLess(bajas_info["ajuste_total_pts"], 0.0)
 
-        plantilla = proyectar_plantilla_partido("Boston Celtics", "Los Angeles Lakers", n_sims=2000)
+        plantilla = proyectar_plantilla_partido("Boston Celtics", "Los Angeles Lakers", n_sims=2000, db_path=self.db_path)
         self.assertGreaterEqual(len(plantilla["top_props"]), 5)
-        print("✅ [8/8] Estadísticas de Jugadores, Player Props (PTS, REB, AST, 3PM, PRA) y Simulador de Bajas verificados.")
+        print("✅ [8/8] Estadísticas de Jugadores SQLite/ESPN, Racha L5, Player Props y Simulador de Bajas verificados.")
 
 
 if __name__ == "__main__":

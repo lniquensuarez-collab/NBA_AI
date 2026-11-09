@@ -42,10 +42,12 @@ from engine.models import (
 from engine.backtest import ejecutar_backtest_walk_forward
 from engine.players import (
     obtener_jugadores_equipo,
+    obtener_bajas_detectadas_equipo,
     obtener_catalogo_completo_jugadores,
     calcular_impacto_bajas,
     proyectar_y_simular_jugador,
     proyectar_plantilla_partido,
+    sincronizar_jugadores_espn,
 )
 
 
@@ -211,22 +213,24 @@ def render_tab_prediccion(
     roster_v = obtener_jugadores_equipo(visita)
     nombres_l = [p["jugador"] for p in roster_l]
     nombres_v = [p["jugador"] for p in roster_v]
+    bajas_auto_l = [b for b in obtener_bajas_detectadas_equipo(local) if b in nombres_l]
+    bajas_auto_v = [b for b in obtener_bajas_detectadas_equipo(visita) if b in nombres_v]
 
-    with st.expander("🏥 Simulador de Bajas / Ausencias de Estrellas y Resumen del Quinteto", expanded=False):
+    with st.expander("🏥 Simulador de Bajas / Ausencias de Estrellas y Resumen del Quinteto (ESPN Injuries)", expanded=False):
         cb1, cb2 = st.columns(2)
         with cb1:
             bajas_l = st.multiselect(
                 f"Bajas / Ausentes en {local}",
                 options=nombres_l,
-                default=[],
-                key="bajas_local_pred",
+                default=bajas_auto_l,
+                key=f"bajas_local_pred_{local}",
             )
         with cb2:
             bajas_v = st.multiselect(
                 f"Bajas / Ausentes en {visita}",
                 options=nombres_v,
-                default=[],
-                key="bajas_visita_pred",
+                default=bajas_auto_v,
+                key=f"bajas_visita_pred_{visita}",
             )
 
         info_bajas = calcular_impacto_bajas(local, visita, bajas_local=bajas_l, bajas_visita=bajas_v)
@@ -1008,11 +1012,26 @@ def render_tab_jugadores(
     bajas_l = st.session_state.get("ultimas_bajas_l", [])
     bajas_v = st.session_state.get("ultimas_bajas_v", [])
 
-    st.caption(
-        f"Contexto activo del partido: **{visita} @ {local}** | "
-        f"Ritmo Esperado (Pace): **{pilares['pace_esperado']:.1f} poss** | "
-        f"DRtg {local}: **{ft['drtg_l']:.1f}** · DRtg {visita}: **{ft['drtg_v']:.1f}**"
-    )
+    col_cap, col_sync = st.columns([3, 1.3])
+    with col_cap:
+        st.caption(
+            f"Contexto activo del partido: **{visita} @ {local}** | "
+            f"Ritmo Esperado (Pace): **{pilares['pace_esperado']:.1f} poss** | "
+            f"DRtg {local}: **{ft['drtg_l']:.1f}** · DRtg {visita}: **{ft['drtg_v']:.1f}**"
+        )
+    with col_sync:
+        if st.button("🔄 Sincronizar Jugadores y Bajas (ESPN Live)", use_container_width=True, key="btn_sync_jug_tab"):
+            barra_j = st.progress(0.0, text="Conectando con ESPN NBA (Plantillas, Lesiones y Boxscores L5)...")
+            res_sync = sincronizar_jugadores_espn(
+                dias_boxscores=14,
+                max_workers=10,
+                progress_callback=lambda p, txt: barra_j.progress(min(1.0, float(p)), text=txt),
+            )
+            st.success(
+                f"¡Sincronizados {res_sync['jugadores_actualizados']} jugadores y "
+                f"{res_sync['lesionados_detectados']} reportes médicos desde ESPN Live!"
+            )
+            st.rerun()
 
     # 1. Proyección completa de plantillas del partido activo
     plantilla = proyectar_plantilla_partido(
@@ -1193,6 +1212,19 @@ def render_tab_datos(df_partidos: pd.DataFrame) -> None:
             if hasattr(st, "cache_data"):
                 st.cache_data.clear()
             st.success(f"Se actualizaron {n_rec} partidos recientes con detalle de cuartos y boxscore.")
+            st.rerun()
+
+        if st.button("⛹️‍♂️ Sincronizar Plantillas, Lesiones y Racha L5 (ESPN Live)", use_container_width=True):
+            barra_p = st.progress(0.0, text="Descargando plantillas, lesionados y boxscores de jugadores desde ESPN...")
+            res_j = sincronizar_jugadores_espn(
+                dias_boxscores=14,
+                max_workers=10,
+                progress_callback=lambda p, txt: barra_p.progress(min(1.0, float(p)), text=txt),
+            )
+            st.success(
+                f"Sincronización completada: {res_j['jugadores_actualizados']} jugadores actualizados, "
+                f"{res_j['lesionados_detectados']} reportes de lesión y {res_j['partidos_boxscore_analizados']} boxscores procesados."
+            )
             st.rerun()
 
     with col_ing2:

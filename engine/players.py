@@ -1,22 +1,30 @@
 """
-Módulo Cuantitativo de Estadísticas de Jugadores, Player Props (PTS, REB, AST, 3PM, PRA)
-y Simulador de Impacto de Estrellas / Bajas (`engine/players.py`).
-- Catálogo base completo de estrellas y titulares clave de las 30 franquicias NBA.
-- Sincronización opcional en vivo con el endpoint público de plantillas/estadísticas de ESPN NBA
-  (100% libre de API keys).
-- Proyección ajustada al contexto del partido (Ritmo esperado `Pace`, Defensa del rival `DRtg`,
-  factor localía y penalización de fatiga `B2B`).
-- Simulación de Monte Carlo correlacionada por jugador para calcular probabilidades exactas
-  `Over %`, `Under %`, `Piso P10 %`, `Cuota Justa` y `EV%` en mercados de:
-    * Puntos (`PTS`)
-    * Rebotes (`REB`)
-    * Asistencias (`AST`)
-    * Triples Anotados (`3PM`)
-    * Combo `PRA` (`PTS + REB + AST`)
-- Simulador de Bajas / Ausencias para ajustar dinámicamente el Spread y Total del partido en `🔮 Predicción`.
+Módulo Cuantitativo de Estadísticas de Jugadores en Tiempo Real (ESPN NBA),
+Player Props (`PTS`, `REB`, `AST`, `3PM`, `PRA`) y Simulador Automático de Bajas / Lesiones (`engine/players.py`).
+
+Arquitectura de Datos Híbrida de Alta Fiabilidad (100% libre de API Keys):
+1. **Sincronización en Vivo desde ESPN NBA (`sincronizar_jugadores_espn`)**:
+   - Consulta en paralelo (`ThreadPoolExecutor`) las plantillas oficiales y el estado médico
+     real (`Active`, `Day-To-Day`, `Out`) de las 30 franquicias en:
+     `https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/roster`
+   - Consulta los boxscores individuales de los últimos partidos jugados desde:
+     `https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={event_id}`
+   - Calcula para cada jugador:
+     * Promedios de temporada (`MIN`, `PTS`, `REB`, `AST`, `3PM`, `PRA`)
+     * Forma reciente en los **últimos 5 partidos (`L5`)**: `pts_l5`, `reb_l5`, `ast_l5`, `tpm_l5`, `pra_l5`
+     * Desviación estándar empírica real de cada jugador (`sd_pts`, `sd_reb`, `sd_ast`)
+     * Estado oficial de lesión (`Activa`, `Duda (GTD)`, `Baja (Out)`) y detalle médico.
+   - Guarda todo en la tabla SQLite `jugadores_stats`.
+2. **Ponderación Cuantitativa (65% Temporada + 35% Racha Últimos 5 Partidos `L5`)**:
+   - Captura cambios recientes de rotación, rachas calientes de tiro y aumentos de minutos.
+3. **Respaldo Calibrado Offline (`BASE_ROSTERS_NBA`)**:
+   - Si no hay red o aún no se ha ejecutado la sincronización en vivo, el motor opera sin
+     interrupciones con el catálogo pre-calibrado de las 30 franquicias.
 """
 
-from typing import Dict, Any, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from typing import Dict, Any, List, Optional, Callable
 import numpy as np
 import pandas as pd
 import requests
@@ -25,8 +33,11 @@ from engine.config import (
     NBA_TEAMS,
     NBA_AVG_PACE,
     NBA_AVG_ORTG,
+    ESPN_SCOREBOARD_URL,
+    ESPN_SUMMARY_URL,
     normalizar_equipo,
 )
+from engine.db import get_connection, init_db
 
 HEADERS = {
     "User-Agent": (
@@ -36,8 +47,9 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# Catálogo base de jugadores clave y estrellas por franquicia NBA:
-# (nombre, posición, min, pts, reb, ast, tpm, usage_pct, impacto_spread_pts)
+ESPN_ROSTER_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/roster"
+
+# Catálogo base pre-calibrado de estrellas y titulares de las 30 franquicias NBA (Fallback Offline)
 BASE_ROSTERS_NBA: Dict[str, List[Dict[str, Any]]] = {
     "Atlanta Hawks": [
         {"jugador": "Trae Young", "pos": "PG", "min": 35.8, "pts": 26.2, "reb": 3.1, "ast": 10.8, "tpm": 3.2, "usg": 30.5, "impacto_pts": 4.2},
@@ -210,43 +222,464 @@ BASE_ROSTERS_NBA: Dict[str, List[Dict[str, Any]]] = {
 }
 
 
-def obtener_jugadores_equipo(equipo: str) -> List[Dict[str, Any]]:
+def _normalizar_jugador_base(p: Dict[str, Any], equipo: str) -> Dict[str, Any]:
+    pts = float(p.get("pts", 15.0))
+    reb = float(p.get("reb", 5.0))
+    ast = float(p.get("ast", 3.5))
+    tpm = float(p.get("tpm", 1.8))
+    pra = round(pts + reb + ast, 1)
+    pts_l5 = float(p.get("pts_l5") if p.get("pts_l5") is not None else pts)
+    reb_l5 = float(p.get("reb_l5") if p.get("reb_l5") is not None else reb)
+    ast_l5 = float(p.get("ast_l5") if p.get("ast_l5") is not None else ast)
+    tpm_l5 = float(p.get("tpm_l5") if p.get("tpm_l5") is not None else tpm)
+    pra_l5 = round(pts_l5 + reb_l5 + ast_l5, 1)
+    usg = float(p.get("usg") or min(35.0, max(14.0, pts * 0.95 + ast * 0.6)))
+    impacto = float(p.get("impacto_pts") or round(max(1.2, (pts * 0.12 + reb * 0.08 + ast * 0.14) - 0.5), 1))
+
+    return {
+        "id": str(p.get("id") or f"{equipo}_{p['jugador']}").replace(" ", "_"),
+        "jugador": str(p["jugador"]),
+        "equipo": normalizar_equipo(equipo),
+        "pos": str(p.get("pos") or "G/F"),
+        "pj": int(p.get("pj") or 20),
+        "min": round(float(p.get("min", 31.0)), 1),
+        "pts": round(pts, 1),
+        "reb": round(reb, 1),
+        "ast": round(ast, 1),
+        "tpm": round(tpm, 1),
+        "pra": pra,
+        "pts_l5": round(pts_l5, 1),
+        "reb_l5": round(reb_l5, 1),
+        "ast_l5": round(ast_l5, 1),
+        "tpm_l5": round(tpm_l5, 1),
+        "pra_l5": pra_l5,
+        "sd_pts": round(float(p.get("sd_pts") or max(3.2, 0.26 * pts)), 2),
+        "sd_reb": round(float(p.get("sd_reb") or max(1.6, 0.30 * reb)), 2),
+        "sd_ast": round(float(p.get("sd_ast") or max(1.4, 0.32 * ast)), 2),
+        "usg": round(usg, 1),
+        "impacto_pts": round(impacto, 1),
+        "estado_lesion": str(p.get("estado_lesion") or "Activa"),
+        "detalle_lesion": str(p.get("detalle_lesion") or ""),
+        "fuente": str(p.get("fuente") or "Catálogo Base Calibrado"),
+        "actualizado_en": str(p.get("actualizado_en") or datetime.now().strftime("%Y-%m-%d")),
+    }
+
+
+def guardar_jugadores_db(
+    jugadores: List[Dict[str, Any]], db_path: Optional[str] = None
+) -> int:
+    """Guarda o actualiza estadísticas y estados de lesión de jugadores en SQLite (`jugadores_stats`)."""
+    if not jugadores:
+        return 0
+    init_db(db_path)
+    conn = get_connection(db_path)
+    cols = [
+        "id", "jugador", "equipo", "pos", "pj", "min", "pts", "reb", "ast", "tpm", "pra",
+        "pts_l5", "reb_l5", "ast_l5", "tpm_l5", "pra_l5", "sd_pts", "sd_reb", "sd_ast",
+        "usg", "impacto_pts", "estado_lesion", "detalle_lesion", "fuente", "actualizado_en",
+    ]
+    placeholders = ", ".join(["?"] * len(cols))
+    update_clause = ", ".join([f"{c}=excluded.{c}" for c in cols if c != "id"])
+    guardados = 0
+    try:
+        cur = conn.cursor()
+        for raw in jugadores:
+            eq = normalizar_equipo(raw.get("equipo"))
+            if not eq or not raw.get("jugador"):
+                continue
+            item = _normalizar_jugador_base(raw, eq)
+            cur.execute(
+                "SELECT id FROM jugadores_stats WHERE jugador = ? AND equipo = ?",
+                (item["jugador"], item["equipo"]),
+            )
+            ex = cur.fetchone()
+            if ex:
+                item["id"] = ex["id"]
+            cur.execute(
+                f"""
+                INSERT INTO jugadores_stats ({', '.join(cols)})
+                VALUES ({placeholders})
+                ON CONFLICT(id) DO UPDATE SET {update_clause}
+                """,
+                [item[c] for c in cols],
+            )
+            guardados += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return guardados
+
+
+def _descargar_roster_y_lesiones_equipo(
+    team_id: str, team_name: str, timeout: int = 8
+) -> Dict[str, Dict[str, Any]]:
     """
-    Retorna la plantilla de jugadores principales para una franquicia NBA
-    con su `PRA` base precalculado (`PTS + REB + AST`).
+    Descarga la plantilla oficial y el estado de lesión en vivo (`Active`, `Day-To-Day`, `Out`)
+    desde el endpoint público de ESPN:
+    `https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/roster`
+    """
+    url = ESPN_ROSTER_URL.format(team_id=team_id)
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=timeout)
+        if resp.status_code != 200:
+            return out
+        data = resp.json()
+        athletes = data.get("athletes", []) or []
+        for ath in athletes:
+            # En NBA ESPN, `athletes` puede ser una lista directa de objetos jugador o grupos por posición
+            items = ath.get("items", [ath]) if isinstance(ath, dict) and "items" in ath else [ath]
+            for p in items:
+                if not isinstance(p, dict):
+                    continue
+                nombre = str(p.get("displayName") or p.get("fullName") or "").strip()
+                if not nombre:
+                    continue
+                pos = str((p.get("position") or {}).get("abbreviation") or "G/F")
+                injuries = p.get("injuries") or []
+                estado_lesion = "Activa"
+                detalle_lesion = ""
+                if injuries and isinstance(injuries[0], dict):
+                    st_raw = str(injuries[0].get("status") or "").lower()
+                    det_raw = str(injuries[0].get("shortComment") or injuries[0].get("longComment") or st_raw)
+                    if "out" in st_raw or "injured" in st_raw or "suspension" in st_raw:
+                        estado_lesion = "Baja (Out)"
+                    elif "day" in st_raw or "questionable" in st_raw or "doubtful" in st_raw:
+                        estado_lesion = "Duda (GTD)"
+                    detalle_lesion = det_raw[:120]
+
+                out[nombre] = {
+                    "id": str(p.get("id") or f"{team_name}_{nombre}"),
+                    "jugador": nombre,
+                    "equipo": team_name,
+                    "pos": pos,
+                    "estado_lesion": estado_lesion,
+                    "detalle_lesion": detalle_lesion,
+                }
+    except Exception:
+        pass
+    return out
+
+
+def _extraer_boxscore_jugadores_summary(event_id: str, timeout: int = 8) -> List[Dict[str, Any]]:
+    """
+    Consulta el endpoint público `/summary?event={event_id}` de ESPN NBA y extrae las
+    actuaciones individuales reales (`MIN`, `PTS`, `REB`, `AST`, `3PM`) de todos los jugadores
+    que participaron en ese partido.
+    """
+    url = ESPN_SUMMARY_URL.format(event_id=event_id)
+    actuaciones: List[Dict[str, Any]] = []
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=timeout)
+        if resp.status_code != 200:
+            return actuaciones
+        data = resp.json()
+        box = data.get("boxscore") or {}
+        players_blocks = box.get("players") or []
+        for team_block in players_blocks:
+            t_info = team_block.get("team") or {}
+            equipo = normalizar_equipo(
+                t_info.get("displayName") or t_info.get("shortDisplayName") or t_info.get("abbreviation")
+            )
+            if not equipo:
+                continue
+            stats_groups = team_block.get("statistics") or []
+            if not stats_groups:
+                continue
+            grp = stats_groups[0]
+            labels = [str(k).upper() for k in (grp.get("labels") or grp.get("names") or [])]
+            athletes = grp.get("athletes") or []
+            for ath_entry in athletes:
+                if ath_entry.get("didNotPlay"):
+                    continue
+                ath_obj = ath_entry.get("athlete") or {}
+                nombre = str(ath_obj.get("displayName") or ath_obj.get("shortName") or "").strip()
+                pos = str((ath_obj.get("position") or {}).get("abbreviation") or "G/F")
+                raw_stats = ath_entry.get("stats") or []
+                if not nombre or not raw_stats or len(raw_stats) < len(labels):
+                    continue
+                s_map = dict(zip(labels, raw_stats))
+                try:
+                    min_str = str(s_map.get("MIN", "0")).split(":")[0]
+                    minutos = float(min_str) if min_str.replace(".", "", 1).isdigit() else 0.0
+                    if minutos < 5.0:
+                        continue
+                    pts = float(s_map.get("PTS", 0))
+                    reb = float(s_map.get("REB", 0))
+                    ast = float(s_map.get("AST", 0))
+                    threept_str = str(s_map.get("3PT", "0-0"))
+                    tpm = float(threept_str.split("-")[0]) if "-" in threept_str else float(threept_str or 0)
+                    actuaciones.append(
+                        {
+                            "jugador": nombre,
+                            "equipo": equipo,
+                            "pos": pos,
+                            "min": minutos,
+                            "pts": pts,
+                            "reb": reb,
+                            "ast": ast,
+                            "tpm": tpm,
+                        }
+                    )
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return actuaciones
+
+
+def sincronizar_jugadores_espn(
+    dias_boxscores: int = 14,
+    max_workers: int = 10,
+    db_path: Optional[str] = None,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Sincroniza en vivo desde ESPN NBA (100% sin API Keys):
+      1. Plantillas actuales y reporte oficial de lesionados (`Active`, `GTD`, `Out`) de las 30 franquicias.
+      2. Boxscores individuales reales de los últimos `dias_boxscores` días para calcular la forma
+         reciente (`L5`: últimos 5 partidos) y la desviación estándar empírica de cada jugador.
+      3. Combina las estadísticas reales de ESPN con los priors de temporada y persiste todo en
+         la tabla SQLite `jugadores_stats`.
+    """
+    init_db(db_path)
+    rosters_espn: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    team_items = list(NBA_TEAMS.items())
+
+    # Paso 1: Descargar plantillas y estado de lesiones en paralelo para las 30 franquicias
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        fut_roster = {
+            ex.submit(_descargar_roster_y_lesiones_equipo, meta["id"], tname): tname
+            for tname, meta in team_items
+        }
+        done_r = 0
+        for fut in as_completed(fut_roster):
+            tname = fut_roster[fut]
+            done_r += 1
+            try:
+                rosters_espn[tname] = fut.result()
+            except Exception:
+                rosters_espn[tname] = {}
+            if progress_callback:
+                progress_callback(
+                    0.45 * (done_r / len(team_items)),
+                    f"Sincronizando plantilla y parte médico de {tname} ({done_r}/30)...",
+                )
+
+    # Paso 2: Recolectar IDs de partidos recientes finalizados desde ESPN Scoreboard o SQLite
+    event_ids: List[str] = []
+    try:
+        conn = get_connection(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM partidos WHERE id NOT LIKE 'SYN_%' ORDER BY fecha DESC LIMIT 90"
+        )
+        event_ids = [str(r["id"]) for r in cur.fetchall() if str(r["id"]).isdigit()]
+        conn.close()
+    except Exception:
+        pass
+
+    if len(event_ids) < 25:
+        hoy = datetime.now().date()
+        for d in range(max(1, int(dias_boxscores))):
+            ymd = (hoy - timedelta(days=d)).strftime("%Y%m%d")
+            try:
+                resp = requests.get(ESPN_SCOREBOARD_URL.format(YYYYMMDD=ymd), headers=HEADERS, timeout=6)
+                if resp.status_code == 200:
+                    for ev in resp.json().get("events", []) or []:
+                        eid = str(ev.get("id", ""))
+                        if eid.isdigit() and eid not in event_ids:
+                            event_ids.append(eid)
+            except Exception:
+                continue
+
+    # Paso 3: Descargar boxscores individuales reales en paralelo
+    logs_por_jugador: Dict[str, List[Dict[str, Any]]] = {}
+    if event_ids:
+        target_events = event_ids[:75]
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            fut_box = {ex.submit(_extraer_boxscore_jugadores_summary, eid): eid for eid in target_events}
+            done_b = 0
+            for fut in as_completed(fut_box):
+                done_b += 1
+                try:
+                    acts = fut.result()
+                    for a in acts:
+                        key_j = f"{a['equipo']}::{a['jugador']}"
+                        logs_por_jugador.setdefault(key_j, []).append(a)
+                except Exception:
+                    pass
+                if progress_callback:
+                    progress_callback(
+                        0.45 + 0.50 * (done_b / len(target_events)),
+                        f"Procesando boxscores reales de jugadores ESPN ({done_b}/{len(target_events)})...",
+                    )
+
+    # Paso 4: Construir registros consolidados (Temporada + Racha L5 + Estado Médico en vivo)
+    ahora_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    registros_finales: List[Dict[str, Any]] = []
+    lesionados_detectados = 0
+
+    for equipo in NBA_TEAMS:
+        base_map = {p["jugador"]: dict(p) for p in BASE_ROSTERS_NBA.get(equipo, [])}
+        espn_map = rosters_espn.get(equipo, {})
+
+        # Unir jugadores del catálogo base con los jugadores activos/lesionados reportados por ESPN
+        nombres_unidos = list(base_map.keys())
+        for n_espn in espn_map:
+            if n_espn not in base_map:
+                # Si tiene logs recientes en boxscore con >= 18 min, lo agregamos automáticamente
+                logs_n = logs_por_jugador.get(f"{equipo}::{n_espn}", [])
+                if logs_n and np.mean([x["min"] for x in logs_n]) >= 18.0:
+                    nombres_unidos.append(n_espn)
+
+        for nombre in nombres_unidos:
+            p_base = base_map.get(nombre, {"jugador": nombre, "pos": "G/F", "min": 24.0, "pts": 12.0, "reb": 4.2, "ast": 2.6, "tpm": 1.3})
+            info_med = espn_map.get(nombre, {})
+            logs = logs_por_jugador.get(f"{equipo}::{nombre}", [])
+
+            estado_les = info_med.get("estado_lesion", "Activa")
+            detalle_les = info_med.get("detalle_lesion", "")
+            if estado_les != "Activa":
+                lesionados_detectados += 1
+
+            if logs:
+                ult5 = logs[:5]
+                pts_l5 = float(np.mean([x["pts"] for x in ult5]))
+                reb_l5 = float(np.mean([x["reb"] for x in ult5]))
+                ast_l5 = float(np.mean([x["ast"] for x in ult5]))
+                tpm_l5 = float(np.mean([x["tpm"] for x in ult5]))
+                min_esp = 0.60 * float(p_base.get("min", 30.0)) + 0.40 * float(np.mean([x["min"] for x in logs]))
+                pts_temp = 0.55 * float(p_base.get("pts", pts_l5)) + 0.45 * float(np.mean([x["pts"] for x in logs]))
+                reb_temp = 0.55 * float(p_base.get("reb", reb_l5)) + 0.45 * float(np.mean([x["reb"] for x in logs]))
+                ast_temp = 0.55 * float(p_base.get("ast", ast_l5)) + 0.45 * float(np.mean([x["ast"] for x in logs]))
+                tpm_temp = 0.55 * float(p_base.get("tpm", tpm_l5)) + 0.45 * float(np.mean([x["tpm"] for x in logs]))
+                sd_pts = float(np.std([x["pts"] for x in logs])) if len(logs) >= 4 else max(3.2, 0.26 * pts_temp)
+                sd_reb = float(np.std([x["reb"] for x in logs])) if len(logs) >= 4 else max(1.6, 0.30 * reb_temp)
+                sd_ast = float(np.std([x["ast"] for x in logs])) if len(logs) >= 4 else max(1.4, 0.32 * ast_temp)
+                fuente_str = f"ESPN Live ({len(logs)} juegos)"
+                pj_val = max(len(logs), 15)
+            else:
+                pts_temp = float(p_base["pts"])
+                reb_temp = float(p_base["reb"])
+                ast_temp = float(p_base["ast"])
+                tpm_temp = float(p_base["tpm"])
+                min_esp = float(p_base["min"])
+                pts_l5, reb_l5, ast_l5, tpm_l5 = pts_temp, reb_temp, ast_temp, tpm_temp
+                sd_pts = max(3.2, 0.26 * pts_temp)
+                sd_reb = max(1.6, 0.30 * reb_temp)
+                sd_ast = max(1.4, 0.32 * ast_temp)
+                fuente_str = "ESPN Roster Live" if info_med else "Catálogo Base Calibrado"
+                pj_val = 25
+
+            registros_finales.append(
+                {
+                    "id": info_med.get("id") or f"{equipo}_{nombre}".replace(" ", "_"),
+                    "jugador": nombre,
+                    "equipo": equipo,
+                    "pos": info_med.get("pos") or p_base.get("pos", "G/F"),
+                    "pj": pj_val,
+                    "min": min_esp,
+                    "pts": pts_temp,
+                    "reb": reb_temp,
+                    "ast": ast_temp,
+                    "tpm": tpm_temp,
+                    "pts_l5": pts_l5,
+                    "reb_l5": reb_l5,
+                    "ast_l5": ast_l5,
+                    "tpm_l5": tpm_l5,
+                    "sd_pts": max(2.5, sd_pts),
+                    "sd_reb": max(1.2, sd_reb),
+                    "sd_ast": max(1.1, sd_ast),
+                    "usg": p_base.get("usg"),
+                    "impacto_pts": p_base.get("impacto_pts"),
+                    "estado_lesion": estado_les,
+                    "detalle_lesion": detalle_les,
+                    "fuente": fuente_str,
+                    "actualizado_en": ahora_str,
+                }
+            )
+
+    total_guardados = guardar_jugadores_db(registros_finales, db_path=db_path)
+    if progress_callback:
+        progress_callback(1.0, f"¡Sincronización de {total_guardados} jugadores completada!")
+
+    return {
+        "jugadores_actualizados": total_guardados,
+        "lesionados_detectados": lesionados_detectados,
+        "partidos_boxscore_analizados": len(event_ids[:75]),
+        "actualizado_en": ahora_str,
+    }
+
+
+def obtener_jugadores_equipo(
+    equipo: str, db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Obtiene los jugadores del equipo desde SQLite (`jugadores_stats`).
+    Si la tabla aún está vacía para ese equipo, la inicializa automáticamente con el
+    catálogo calibrado y retorna la lista completa.
     """
     canon = normalizar_equipo(equipo)
-    lista_base = BASE_ROSTERS_NBA.get(canon, [])
-    salida: List[Dict[str, Any]] = []
-    for p in lista_base:
-        item = dict(p)
-        item["equipo"] = canon
-        item["pra"] = round(float(item["pts"]) + float(item["reb"]) + float(item["ast"]), 1)
-        salida.append(item)
-    return salida
+    init_db(db_path)
+    conn = get_connection(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM jugadores_stats WHERE equipo = ? ORDER BY pts DESC",
+            (canon,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        if rows:
+            return rows
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+    base_list = [_normalizar_jugador_base(p, canon) for p in BASE_ROSTERS_NBA.get(canon, [])]
+    if base_list:
+        guardar_jugadores_db(base_list, db_path=db_path)
+    return base_list
 
 
-def obtener_catalogo_completo_jugadores() -> pd.DataFrame:
+def obtener_bajas_detectadas_equipo(
+    equipo: str, db_path: Optional[str] = None
+) -> List[str]:
+    """
+    Retorna la lista de jugadores cuyo `estado_lesion` en vivo es `Baja (Out)`
+    para pre-cargarlos automáticamente en el Simulador de Bajas.
+    """
+    jugs = obtener_jugadores_equipo(equipo, db_path=db_path)
+    return [j["jugador"] for j in jugs if "Baja" in str(j.get("estado_lesion", ""))]
+
+
+def obtener_catalogo_completo_jugadores(db_path: Optional[str] = None) -> pd.DataFrame:
     """
     Retorna un DataFrame con todos los jugadores principales de las 30 franquicias NBA,
-    ordenado por `PRA` (`PTS + REB + AST`) y `PTS`.
+    mostrando sus medias de temporada, su racha reciente `L5 (últimos 5 juegos)`,
+    su estado médico oficial (`Activa / Duda GTD / Baja Out`) y la fuente de datos.
     """
     filas: List[Dict[str, Any]] = []
     for eq in NBA_TEAMS:
-        for p in obtener_jugadores_equipo(eq):
+        for p in obtener_jugadores_equipo(eq, db_path=db_path):
             filas.append(
                 {
                     "Jugador": p["jugador"],
                     "Equipo": p["equipo"],
                     "Pos": p["pos"],
+                    "Estado": p.get("estado_lesion", "Activa"),
                     "MIN": round(float(p["min"]), 1),
                     "PTS": round(float(p["pts"]), 1),
+                    "PTS (L5)": round(float(p.get("pts_l5", p["pts"])), 1),
                     "REB": round(float(p["reb"]), 1),
                     "AST": round(float(p["ast"]), 1),
                     "3PM": round(float(p["tpm"]), 1),
                     "PRA (PTS+REB+AST)": round(float(p["pra"]), 1),
+                    "PRA (L5)": round(float(p.get("pra_l5", p["pra"])), 1),
                     "USG%": round(float(p["usg"]), 1),
                     "Impacto Spread (pts)": round(float(p["impacto_pts"]), 1),
+                    "Fuente": p.get("fuente", "Catálogo Base"),
                 }
             )
     df = pd.DataFrame(filas)
@@ -260,27 +693,24 @@ def calcular_impacto_bajas(
     equipo_visita: str,
     bajas_local: Optional[List[str]] = None,
     bajas_visita: Optional[List[str]] = None,
+    db_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Calcula el impacto en puntos sobre el Spread y el Total del partido cuando uno o más
-    jugadores clave de `equipo_local` o `equipo_visita` son marcados como Baja / Ausentes,
-    aplicando redistribución de posesión (Usage Redistribution ~35% absorbido por compañeros,
-    65% pérdida neta de eficiencia).
+    jugadores clave de `equipo_local` o `equipo_visita` son marcados como Baja / Ausentes.
     """
     canon_l = normalizar_equipo(equipo_local)
     canon_v = normalizar_equipo(equipo_visita)
     bajas_l_set = set(bajas_local or [])
     bajas_v_set = set(bajas_visita or [])
 
-    roster_l = {p["jugador"]: p for p in obtener_jugadores_equipo(canon_l)}
-    roster_v = {p["jugador"]: p for p in obtener_jugadores_equipo(canon_v)}
+    roster_l = {p["jugador"]: p for p in obtener_jugadores_equipo(canon_l, db_path=db_path)}
+    roster_v = {p["jugador"]: p for p in obtener_jugadores_equipo(canon_v, db_path=db_path)}
 
     perdida_l = sum(float(roster_l[j]["impacto_pts"]) for j in bajas_l_set if j in roster_l)
     perdida_v = sum(float(roster_v[j]["impacto_pts"]) for j in bajas_v_set if j in roster_v)
 
-    # Impacto neto sobre el margen del local (positivo si las bajas perjudican más a la visita)
     ajuste_spread_local = round(perdida_v - perdida_l, 2)
-    # Impacto sobre el total de puntos del partido (ausencia de anotadores reduce ligeramente el ritmo/eficiencia ofensiva)
     ajuste_total_pts = round(-0.55 * (perdida_l + perdida_v), 2)
 
     return {
@@ -312,12 +742,10 @@ def proyectar_y_simular_jugador(
       4. `3PM` (Triples Anotados)
       5. `PRA` (`PTS + REB + AST`)
 
-    Ajustes contextuales aplicados automáticamente:
-      - Factor Ritmo: `pace_esperado / NBA_AVG_PACE`
-      - Factor Defensa Rival: `drtg_rival / NBA_AVG_ORTG`
-      - Factor Localía: `+1.8%` en casa / `-1.2%` de visita
-      - Factor Fatiga B2B: `-4.5%` en tiro/minutos si el equipo llega en Back-to-Back
-      - Redistribución de Usage (`bajas_companeros_usg`): incrementa volumen si falta una estrella compañera.
+    Fórmula de Proyección Híbrida Cuantitativa:
+      - Base Ponderada = **65% Promedio Temporada + 35% Forma Reciente `L5` (Últimos 5 Juegos)**
+      - Multiplicadores contextuales: Ritmo (`Pace`), Defensa Rival (`DRtg`), Localía (`+1.8%`),
+        Fatiga `B2B` (`-4.5%`) y Redistribución de `Usage%` por bajas de compañeros.
     """
     rng = np.random.default_rng(seed)
     n_sims = int(np.clip(n_sims, 1000, 15000))
@@ -326,36 +754,37 @@ def proyectar_y_simular_jugador(
     f_def = float(np.clip(drtg_rival / NBA_AVG_ORTG, 0.88, 1.14))
     f_home = 1.018 if es_local else 0.988
     f_b2b = 0.955 if en_b2b else 1.00
-    # Si falta un compañero titular, el jugador absorbe ~22% del usage liberado
     f_usg_boost = float(np.clip(1.0 + 0.0065 * float(bajas_companeros_usg), 1.0, 1.22))
 
     mult_ofensivo = f_pace * f_def * f_home * f_b2b * f_usg_boost
     mult_rebotes = f_pace * (1.01 if es_local else 0.995) * (0.97 if en_b2b else 1.0) * (1.0 + 0.003 * float(bajas_companeros_usg))
 
-    mu_pts = max(2.0, float(jugador_info["pts"]) * mult_ofensivo)
-    mu_reb = max(1.0, float(jugador_info["reb"]) * mult_rebotes)
-    mu_ast = max(0.8, float(jugador_info["ast"]) * mult_ofensivo)
-    mu_tpm = max(0.1, float(jugador_info["tpm"]) * mult_ofensivo)
+    # Ponderación 65% Temporada + 35% Racha reciente L5
+    pts_base = 0.65 * float(jugador_info["pts"]) + 0.35 * float(jugador_info.get("pts_l5", jugador_info["pts"]))
+    reb_base = 0.65 * float(jugador_info["reb"]) + 0.35 * float(jugador_info.get("reb_l5", jugador_info["reb"]))
+    ast_base = 0.65 * float(jugador_info["ast"]) + 0.35 * float(jugador_info.get("ast_l5", jugador_info["ast"]))
+    tpm_base = 0.65 * float(jugador_info["tpm"]) + 0.35 * float(jugador_info.get("tpm_l5", jugador_info["tpm"]))
+
+    mu_pts = max(2.0, pts_base * mult_ofensivo)
+    mu_reb = max(1.0, reb_base * mult_rebotes)
+    mu_ast = max(0.8, ast_base * mult_ofensivo)
+    mu_tpm = max(0.1, tpm_base * mult_ofensivo)
     mu_pra = mu_pts + mu_reb + mu_ast
 
-    # Simulación correlacionada a través de los minutos jugados en el partido (factor latente común)
-    # Si el jugador tiene más minutos (partido cerrado o prórroga), PTS, REB y AST suben juntos:
     min_base = float(jugador_info.get("min", 32.0))
     min_sim = np.clip(rng.normal(min_base, 3.4, size=n_sims), 14.0, 46.0)
     min_ratio = min_sim / max(15.0, min_base)
 
-    # Simulaciones individuales condicionadas al ratio de minutos
-    sd_pts = max(3.2, 0.27 * mu_pts)
-    sd_reb = max(1.6, 0.31 * mu_reb)
-    sd_ast = max(1.4, 0.33 * mu_ast)
+    sd_pts = float(jugador_info.get("sd_pts") or max(3.2, 0.27 * mu_pts))
+    sd_reb = float(jugador_info.get("sd_reb") or max(1.6, 0.31 * mu_reb))
+    sd_ast = float(jugador_info.get("sd_ast") or max(1.4, 0.33 * mu_ast))
 
     pts_sim = np.maximum(0.0, np.rint(rng.normal(mu_pts * min_ratio, sd_pts)))
     reb_sim = np.maximum(0.0, np.rint(rng.normal(mu_reb * min_ratio, sd_reb)))
     ast_sim = np.maximum(0.0, np.rint(rng.normal(mu_ast * min_ratio, sd_ast)))
-    tpm_sim = np.rng_poisson if hasattr(np, "rng_poisson") else rng.poisson(lam=np.clip(mu_tpm * min_ratio, 0.05, 12.0))
+    tpm_sim = rng.poisson(lam=np.clip(mu_tpm * min_ratio, 0.05, 12.0))
     pra_sim = pts_sim + reb_sim + ast_sim
 
-    # Líneas estándar de casa de apuestas (terminadas en .5 alrededor de la media proyectada)
     lineas_default = {
         "PTS": float(np.floor(mu_pts - 0.3) + 0.5),
         "REB": float(np.floor(mu_reb - 0.2) + 0.5),
@@ -369,21 +798,26 @@ def proyectar_y_simular_jugador(
                 lineas_default[k] = float(v)
 
     sims_map = {
-        "PTS": (pts_sim, mu_pts, "Puntos (PTS)"),
-        "REB": (reb_sim, mu_reb, "Rebotes (REB)"),
-        "AST": (ast_sim, mu_ast, "Asistencias (AST)"),
-        "3PM": (tpm_sim, mu_tpm, "Triples (3PM)"),
-        "PRA": (pra_sim, mu_pra, "Combo PRA (PTS+REB+AST)"),
+        "PTS": (pts_sim, mu_pts, "Puntos (PTS)", float(jugador_info["pts"]), float(jugador_info.get("pts_l5", jugador_info["pts"]))),
+        "REB": (reb_sim, mu_reb, "Rebotes (REB)", float(jugador_info["reb"]), float(jugador_info.get("reb_l5", jugador_info["reb"]))),
+        "AST": (ast_sim, mu_ast, "Asistencias (AST)", float(jugador_info["ast"]), float(jugador_info.get("ast_l5", jugador_info["ast"]))),
+        "3PM": (tpm_sim, mu_tpm, "Triples (3PM)", float(jugador_info["tpm"]), float(jugador_info.get("tpm_l5", jugador_info["tpm"]))),
+        "PRA": (
+            pra_sim,
+            mu_pra,
+            "Combo PRA (PTS+REB+AST)",
+            float(jugador_info.get("pra", pts_base + reb_base + ast_base)),
+            float(jugador_info.get("pra_l5", pts_base + reb_base + ast_base)),
+        ),
     }
 
     mercados_out: Dict[str, Dict[str, Any]] = {}
     tabla_resumen: List[Dict[str, Any]] = []
 
-    # Dividir en 10 bloques para obtener Piso P10 de cada prop
     n_blocks = 10
     block_size = max(50, n_sims // n_blocks)
 
-    for code, (arr_sim, media_esp, etiqueta) in sims_map.items():
+    for code, (arr_sim, media_esp, etiqueta, m_temp, m_l5) in sims_map.items():
         lin = lineas_default[code]
         arr_blocks = arr_sim[: n_blocks * block_size].reshape(n_blocks, block_size)
         over_b = np.mean(arr_blocks > lin, axis=1)
@@ -418,7 +852,8 @@ def proyectar_y_simular_jugador(
         tabla_resumen.append(
             {
                 "Mercado": etiqueta,
-                "Media Base": round(float(jugador_info["pra" if code == "PRA" else ("tpm" if code == "3PM" else code.lower())]), 1),
+                "Media Temp.": round(m_temp, 1),
+                "Racha L5": round(m_l5, 1),
                 "Proyección Ajustada": round(float(media_esp), 2),
                 "Línea": lin,
                 "Over %": round(p_ov * 100.0, 1),
@@ -433,6 +868,9 @@ def proyectar_y_simular_jugador(
         "jugador": jugador_info["jugador"],
         "equipo": jugador_info.get("equipo", ""),
         "pos": jugador_info.get("pos", ""),
+        "estado_lesion": jugador_info.get("estado_lesion", "Activa"),
+        "detalle_lesion": jugador_info.get("detalle_lesion", ""),
+        "fuente": jugador_info.get("fuente", "Catálogo Base"),
         "min_esp": round(min_base * (0.96 if en_b2b else 1.0), 1),
         "mercados": mercados_out,
         "tabla_resumen": tabla_resumen,
@@ -450,18 +888,19 @@ def proyectar_plantilla_partido(
     bajas_local: Optional[List[str]] = None,
     bajas_visita: Optional[List[str]] = None,
     n_sims: int = 3500,
+    db_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Genera la tabla proyectada de todos los jugadores activos de ambos equipos en un partido,
-    redistribuyendo automáticamente el Usage% y tiros cuando hay bajas seleccionadas.
+    redistribuyendo automáticamente el Usage% y tiros cuando hay bajas seleccionadas o detectadas.
     """
     canon_l = normalizar_equipo(equipo_local)
     canon_v = normalizar_equipo(equipo_visita)
     bajas_l_set = set(bajas_local or [])
     bajas_v_set = set(bajas_visita or [])
 
-    roster_l = obtener_jugadores_equipo(canon_l)
-    roster_v = obtener_jugadores_equipo(canon_v)
+    roster_l = obtener_jugadores_equipo(canon_l, db_path=db_path)
+    roster_v = obtener_jugadores_equipo(canon_v, db_path=db_path)
 
     usg_liberado_l = sum(float(p["usg"]) for p in roster_l if p["jugador"] in bajas_l_set)
     usg_liberado_v = sum(float(p["usg"]) for p in roster_v if p["jugador"] in bajas_v_set)
@@ -489,6 +928,7 @@ def proyectar_plantilla_partido(
                 {
                     "Jugador": p["jugador"],
                     "Equipo": canon_l,
+                    "Estado": sim_p["estado_lesion"],
                     "Mercado": m_data["etiqueta"],
                     "Proyección": m_data["proyeccion"],
                     "Selección": m_data["recomendacion"],
@@ -517,6 +957,7 @@ def proyectar_plantilla_partido(
                 {
                     "Jugador": p["jugador"],
                     "Equipo": canon_v,
+                    "Estado": sim_p["estado_lesion"],
                     "Mercado": m_data["etiqueta"],
                     "Proyección": m_data["proyeccion"],
                     "Selección": m_data["recomendacion"],
